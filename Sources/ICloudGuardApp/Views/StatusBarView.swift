@@ -8,7 +8,7 @@ struct StatusBarView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
-            // Status header — monochrome, compact
+            // Status header
             HStack(spacing: 6) {
                 Image(systemName: viewModel.statusIcon)
                     .font(.system(size: 14, weight: .medium))
@@ -17,9 +17,14 @@ struct StatusBarView: View {
                     .font(.system(size: 13, weight: .semibold))
                     .foregroundStyle(.primary)
                 Spacer()
+                if viewModel.freeSpaceBytes > 0 {
+                    Text(viewModel.freeSpaceLabel + " free")
+                        .font(.system(size: 10, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                }
             }
 
-            // Pollution gauge — the key metric
+            // Pollution gauge
             if viewModel.materializedCount > 0 || viewModel.datalessCount > 0 {
                 VStack(alignment: .leading, spacing: 3) {
                     HStack {
@@ -31,7 +36,6 @@ struct StatusBarView: View {
                             .font(.system(size: 11, design: .monospaced))
                             .foregroundStyle(.secondary)
                     }
-                    // Pollution bar — monochrome
                     GeometryReader { geo in
                         ZStack(alignment: .leading) {
                             RoundedRectangle(cornerRadius: 2)
@@ -55,7 +59,28 @@ struct StatusBarView: View {
                 }
             }
 
-            // Defense status — compact badges
+            // Top folders by local space
+            if !viewModel.topFolders.isEmpty {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Top folders")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.tertiary)
+                    ForEach(viewModel.topFolders.prefix(3), id: \.name) { folder in
+                        HStack {
+                            Text(folder.name)
+                                .font(.system(size: 10))
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                            Spacer()
+                            Text(formatBytes(folder.bytes))
+                                .font(.system(size: 10, design: .monospaced))
+                                .foregroundStyle(.tertiary)
+                        }
+                    }
+                }
+            }
+
+            // Defense status badges
             HStack(spacing: 8) {
                 if viewModel.suppressionActive {
                     Label("Suppressed", systemImage: "checkmark.circle.fill")
@@ -75,7 +100,14 @@ struct StatusBarView: View {
                 Spacer()
             }
 
-            // Error display — only if present
+            // Lifetime stats
+            if viewModel.lifetimeEvictedCount > 0 {
+                Text("Lifetime: \(viewModel.lifetimeLabel)")
+                    .font(.system(size: 9))
+                    .foregroundStyle(.tertiary)
+            }
+
+            // Error display
             if let error = viewModel.lastError, !error.isEmpty {
                 Text(error)
                     .font(.system(size: 10))
@@ -85,7 +117,7 @@ struct StatusBarView: View {
 
             Divider()
 
-            // Actions — full width, vertical stack
+            // Actions
             Button {
                 viewModel.runEviction()
             } label: {
@@ -117,7 +149,7 @@ struct StatusBarView: View {
 
             Divider()
 
-            // Settings + Quit — full width
+            // Settings + Quit
             SettingsLink {
                 Label("Settings", systemImage: "gearshape")
                     .frame(maxWidth: .infinity)
@@ -138,9 +170,20 @@ struct StatusBarView: View {
             .padding(.vertical, 2)
         }
         .padding(12)
-        .frame(width: 260)
+        .frame(width: 280)
         .onAppear {
             viewModel.startGuardService(scopePath: configModel.config.scope.path)
+            // Listen for global hotkey Cmd+Shift+E
+            NotificationCenter.default.addObserver(forName: .icloudGuardEvict, object: nil, queue: .main) { _ in
+                viewModel.runEviction()
+            }
         }
+    }
+
+    private func formatBytes(_ bytes: Int64) -> String {
+        let f = ByteCountFormatter()
+        f.allowedUnits = [.useGB, .useMB, .useKB]
+        f.countStyle = .file
+        return f.string(fromByteCount: bytes)
     }
 }

@@ -43,7 +43,7 @@ public struct ICloudGuardApp: App {
             StatusBarView(viewModel: viewModel)
                 .environment(appConfigModel)
         } label: {
-            Label("iCloud Guard", systemImage: viewModel.statusIcon)
+            Image(systemName: viewModel.statusIcon)
         }
         .menuBarExtraStyle(.window)
 
@@ -60,4 +60,19 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
         AppPaths.unlinkSocket()
         AppPaths.removePID()
     }
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        // Global hotkey: Cmd+Shift+E to trigger eviction
+        NSEvent.addGlobalMonitorForEvents(matching: .keyDown) { event in
+            if event.modifierFlags.contains([.command, .shift]) && event.charactersIgnoringModifiers?.lowercased() == "e" {
+                Task { @MainActor in
+                    NotificationCenter.default.post(name: .icloudGuardEvict, object: nil)
+                }
+            }
+        }
+    }
+}
+
+extension Notification.Name {
+    static let icloudGuardEvict = Notification.Name("icloudGuardEvict")
 }
