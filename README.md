@@ -1,10 +1,10 @@
 # iCloud Guard
 
-yeah well, this was initially just a script in my [nix-darwin](https://github.com/nix-darwin/nix-darwin) repo where each `nix-darwin switch` builds a simple swift binary that [launchd](https://en.wikipedia.org/wiki/Launchd) manages to reactively prune icloud storage when it goes berserk and trying to fill your mac so you upgrade.
+yeah well, this was initially just a script in my [nix-darwin](https://github.com/nix-darwin/nix-darwin) repo where each `nix-darwin switch` builds a simple swift binary that [launchd](https://en.wikipedia.org/wiki/Launchd) manages to reactively prune icloud storage by removing local copies (not deleting the actual files/folders upstream) when it goes berserk and trying to fill your mac so you upgrade. kinda like playing whackamole.
 
 a deep investigation of the root cause surfaced that apple has this speculative download enabled in a private framework on macos and on icloud infra server-side they do a [CloudKit](https://developer.apple.com/documentation/cloudkit) push every single time even just a single thing, doesnt matter if it's just metadata, changes, on any one of your devices connected under your icloud account, so it triggers a rematerialization attempt and downstream speculative downloading on macos tries to fetch the update and rematerialize a local copy, that's why sometimes you go to bed and you wake up and you see your mac becomes extremely sluggish and you find out you only have 10gb free disk space on your 512gb macbook.
 
-the actual mechanism, traced from [system logs](https://developer.apple.com/logs/) (`log show --predicate 'process == "bird"' --last 1h --info`), goes like this:
+the actual mechanism, traced from system logs (`log show --predicate 'process == "bird"' --last 1h --info`), goes like this:
 
 1. your iphone (or any device) changes a file in icloud — even just metadata
 2. apple's [cloudkit](https://developer.apple.com/documentation/cloudkit) sends a push notification to your mac — the logs show `Sync down (push triggered)` → `CKFetchRecordZoneChangesOperation`
@@ -68,7 +68,7 @@ aggressive last-resort measures:
 - it cannot stop finder from holding background enumerators on the icloud root
 - it cannot set [`NSFileProviderContentPolicy.downloadLazily`](https://developer.apple.com/documentation/fileprovider/nsfileprovideritem/contentpolicy) on items (read-only from outside the file provider extension)
 
-what it *can* do: eliminate the spotlight trigger, eliminate the quicklook trigger, make the guard's own reads non-materializing, and reverse rematerialization within seconds instead of minutes. the net effect is dramatically less local disk usage and fewer cpu-burning download/evict cycles.
+what it _can_ do: eliminate the spotlight trigger, eliminate the quicklook trigger, make the guard's own reads non-materializing, and reverse rematerialization within seconds instead of minutes. the net effect is dramatically less local disk usage and fewer cpu-burning download/evict cycles.
 
 ## installation
 
