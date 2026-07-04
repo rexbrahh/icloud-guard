@@ -1,14 +1,25 @@
 import Foundation
 import UserNotifications
 
-/// Actor that manages local notifications with lazy authorization.
+/// Actor that manages local notifications with lazy authorization, throttling, and batching.
 ///
-/// Authorization is requested only when the current status is `.notDetermined`.
-/// Notifications use stable identifiers and are grouped by threadIdentifier.
+/// - Rematerialization notifications are throttled: only one per 60 seconds per category.
+///   The path and count are batched into a single notification.
+/// - Pollution threshold notifications are throttled to one per 5 minutes.
+/// - Eviction completion notifications are always sent (user-initiated, low frequency).
 actor Notifier {
     static let shared = Notifier()
 
     private var hasAuthorized = false
+
+    // Throttling state
+    private var lastRematerializationNotify: Date?
+    private var rematerializationBatchCount = 0
+    private var lastPollutionNotify: Date?
+
+    // Minimum interval between throttled notifications (seconds)
+    private let rematerializationThrottleSeconds: TimeInterval = 60
+    private let pollutionThrottleSeconds: TimeInterval = 300
 
     /// Request notification authorization if not yet determined.
     func ensureAuthorized() async {
@@ -20,12 +31,7 @@ actor Notifier {
         hasAuthorized = true
     }
 
-    /// Send a local notification with stable identifier.
-    /// - Parameters:
-    ///   - identifier: Stable identifier for the notification (deduplication)
-    ///   - title: Notification title
-    ///   - body: Notification body
-    ///   - threadIdentifier: Grouping identifier (optional)
+    /// Send a local notification.
     func notify(identifier: String, title: String, body: String, threadIdentifier: String? = nil) async {
         await ensureAuthorized()
 
@@ -37,20 +43,19 @@ actor Notifier {
             content.threadIdentifier = thread
         }
 
-        // Floor trigger at 0.5s to avoid immediate-fire issues
         let trigger = UNTimeIntervalNotificationTrigger(timeInterval: 0.5, repeats: false)
         let request = UNNotificationRequest(identifier: identifier, content: content, trigger: trigger)
 
         do {
             try await UNUserNotificationCenter.current().add(request)
         } catch {
-            // Swallow errors — notifications are best-effort
             let msg = "Notifier: failed to schedule notification: \(error)\n"
             FileHandle.standardError.write(Data(msg.utf8))
         }
     }
 
-    /// Convenience: notify on eviction completion.
+    // MARK: - Eviction (always sent — user-initiated, low frequency)
+
     func notifyEvictionComplete(evictedCount: Int, reclaimedBytes: Int64) async {
         await notify(
             identifier: "icloud-guard.eviction.\(Int(Date().timeIntervalSince1970))",
@@ -60,24 +65,65 @@ actor Notifier {
         )
     }
 
-    /// Convenience: notify on rematerialization detected.
+    // MARK: - Rematerialization (throttled + batched)
+
     func notifyRematerialization(path: String) async {
+        let now = Date()
+        rematerializationBatchCount += 1
+
+        if let last = lastRematerializationNotify,
+           now.timeIntervalSince(last) < rematerializationThrottleSeconds {
+            // Within throttle window — skip, count will be included in next flush
+            return
+        }
+
+        // Flush: send a batched notification
+        let body: String
+        if rematerializationBatchCount > 1 {
+            body = "\(rematerializationBatchCount) files rematerialized (latest: \(shorten(path: path)))"
+        } else {
+            body = "Rematerialization detected: \(shorten(path: path))"
+        }
+
         await notify(
-            identifier: "icloud-guard.rematerial.\(Int(Date().timeIntervalSince1970))",
+            identifier: "icloud-guard.rematerial.\(Int(now.timeIntervalSince1970))",
             title: "iCloud Guard",
-            body: "Rematerialization detected: \(path)",
+            body: body,
             threadIdentifier: "icloud-guard.rematerial"
         )
+
+        lastRematerializationNotify = now
+        rematerializationBatchCount = 0
     }
 
-    /// Convenience: notify on pollution threshold crossing.
+    // MARK: - Pollution threshold (throttled)
+
     func notifyPollutionThreshold(ratio: Double) async {
+        let now = Date()
+
+        if let last = lastPollutionNotify,
+           now.timeIntervalSince(last) < pollutionThrottleSeconds {
+            return
+        }
+
         await notify(
-            identifier: "icloud-guard.pollution.\(Int(Date().timeIntervalSince1970))",
+            identifier: "icloud-guard.pollution.\(Int(now.timeIntervalSince1970))",
             title: "iCloud Guard",
             body: "Pollution threshold crossed: \(Int(ratio * 100))%",
             threadIdentifier: "icloud-guard.pollution"
         )
+
+        lastPollutionNotify = now
+    }
+
+    // MARK: - Helpers
+
+    private func shorten(path: String) -> String {
+        let components = path.split(separator: "/")
+        if components.count > 3 {
+            return "…/" + components.suffix(2).joined(separator: "/")
+        }
+        return path
     }
 
     private func formatBytes(_ bytes: Int64) -> String {
