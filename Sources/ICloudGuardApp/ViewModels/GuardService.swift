@@ -44,7 +44,7 @@ actor GuardService {
             evictorFactory: { logger in PackageAwareEvictor(logger: logger) }
         )
         w.onRematerialization = { [weak self] event in
-            Task { await self?.handleRematerialization(event) }
+            Task { [weak self] in await self?.handleRematerialization(event) }
         }
         w.start()
         watcher = w
@@ -84,7 +84,7 @@ actor GuardService {
             evictorFactory: { logger in PackageAwareEvictor(logger: logger) }
         )
         w.onRematerialization = { [weak self] event in
-            Task { await self?.handleRematerialization(event) }
+            Task { [weak self] in await self?.handleRematerialization(event) }
         }
         w.start()
         watcher = w

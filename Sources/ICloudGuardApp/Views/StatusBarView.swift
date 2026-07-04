@@ -4,7 +4,7 @@ import ICloudGuardCore
 
 struct StatusBarView: View {
     @ObservedObject var viewModel: GuardViewModel
-    @Environment(\.openSettings) private var openSettings
+    @Environment(\.openSettings) private var openSettings: OpenSettingsAction
     @Environment(AppConfigModel.self) private var configModel
 
     var body: some View {

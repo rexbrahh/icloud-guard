@@ -102,9 +102,9 @@ private struct PolicySettingsView: View {
     @Environment(AppConfigModel.self) private var configModel
     @State private var newProtectedPath = ""
 
-    private var protectedPaths: [String] { configModel.config.scope.protectedPaths }
+    @MainActor private var protectedPaths: [String] { configModel.config.scope.protectedPaths }
 
-    private func saveProtectedPaths(_ paths: [String]) {
+    @MainActor private func saveProtectedPaths(_ paths: [String]) {
         configModel.updateScope(.init(path: configModel.config.scope.path, protectedPaths: paths))
     }
 
