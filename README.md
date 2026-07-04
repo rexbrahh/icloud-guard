@@ -108,6 +108,16 @@ pollution_check_interval_seconds = 300
 
 [scope]
 path = "~/Library/Mobile Documents/com~apple~CloudDocs"
+
+[policy]
+target_local_gib = 30
+trim_local_gib = 35
+warn_free_gib = 80
+remediate_free_gib = 50
+panic_free_gib = 25
+cooldown_minutes = 30
+growth_trigger_gib = 20
+growth_window_minutes = 10
 ```
 
 all app files live under `~/.icloud-guard/` — config, logs, future state. nothing in `~/Library/Application Support/` or `~/Library/Logs/`.
@@ -125,7 +135,47 @@ the dropdown shows:
 - **evict now** — evict all materialized icloud files (up to batch limit, default 500)
 - **panic evict** — evict everything up to the panic limit (default 2000 files)
 - **settings** — or press cmd+, when the popover is open
+- **pause/resume** — temporarily stop the watcher, pollution checks, and network-triggered auto-eviction. suppression stays active. click pause to disable the evict buttons, click resume to restart
 
+## cli
+
+icloud guard comes with a full cli that talks to the running menu bar app via a unix domain socket at `~/.icloud-guard/guard.sock`. if the app isn't running, the cli falls back to running the eviction engine in-process.
+
+### installation
+
+the cli wrapper is installed automatically when you run `./scripts/build-app.sh --install`:
+
+```bash
+~/bin/icloud-guard --help
+```
+
+add `~/bin` to your `PATH` if it's not already there.
+
+### subcommands
+
+```bash
+icloud-guard status          # show icloud drive status
+icloud-guard evict           # evict materialized files
+icloud-guard evict --dry-run # preview what would be evicted
+icloud-guard panic-evict     # evict everything up to panic limit
+icloud-guard config show     # print current config.toml
+icloud-guard --version       # print version
+icloud-guard --help          # show help
+```
+
+### socket
+
+the cli communicates with the running app via a unix domain socket at `~/.icloud-guard/guard.sock`, authenticated with a random token at `~/.icloud-guard/guard.token` (mode 0600). if the socket is unavailable, the cli falls back to in-process execution.
+
+## notifications
+
+icloud guard sends local notifications for:
+
+- eviction completion (file count + reclaimed bytes)
+- rematerialization detected (file path)
+- pollution threshold crossing (>70%)
+
+notifications appear even when the app is in the foreground. authorize them in system settings → notifications → icloud guard if prompted.
 ## acknowledgments
 
 - [howard oakley (eclectic light)](https://eclecticlight.co/) — for documenting the sonoma fileprovider eviction regression and the `com.apple.fileprovider.pinned` xattr mechanism
