@@ -15,10 +15,10 @@ actor GuardService {
     private let eventHandler: (GuardServiceEvent) -> Void
 
     init(scopePath: String, eventHandler: @escaping (GuardServiceEvent) -> Void) {
+        AppPaths.ensureHomeDir()
         self.scopePath = scopePath
         self.eventHandler = eventHandler
-        let logPath = "\(NSHomeDirectory())/Library/Logs/icloud-guard.log"
-        self.logger = Logger(logPath: logPath)
+        self.logger = Logger(logPath: AppPaths.log.path)
         self.configStore = ConfigStore()
         self.config = configStore.load()
     }

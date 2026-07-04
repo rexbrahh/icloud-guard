@@ -2,7 +2,7 @@ import Foundation
 
 /// TOML-based application configuration.
 ///
-/// Lives at ~/Library/Application Support/ICloudGuard/config.toml
+/// Lives at ~/.icloud-guard/config.toml
 /// No JSON anywhere in the app. The TOML is hand-writable and human-readable.
 ///
 /// Example config.toml:
@@ -88,9 +88,8 @@ public struct AppConfig: Equatable, Sendable {
 public final class ConfigStore {
     private let configURL: URL
 
-    public init(configDir: String? = nil) {
-        let dir = configDir ?? "\(NSHomeDirectory())/Library/Application Support/ICloudGuard"
-        self.configURL = URL(fileURLWithPath: dir).appendingPathComponent("config.toml")
+    public init(configURL: URL? = nil) {
+        self.configURL = configURL ?? AppPaths.config
     }
 
     public var configURLPath: String { configURL.path }
