@@ -248,18 +248,19 @@ actor GuardService {
             options: [.skipsHiddenFiles]
         ) else { return }
 
-        let allURLs = enumerator.allObjects.compactMap { $0 as? URL }
-
-        for url in allURLs {
-            guard url.lastPathComponent.hasPrefix(".") == false else { continue }
-            var st = stat()
-            guard lstat(url.path, &st) == 0 else { continue }
-            if (st.st_flags & SF_DATALESS) != 0 {
-                dataless += 1
-            } else if st.st_size > 0 {
-                materialized += 1
+        // Lazy iteration — never materialize all URLs into an array (439K+ files)
+        autoreleasepool {
+            for case let url as URL in enumerator {
+                guard url.lastPathComponent.hasPrefix(".") == false else { continue }
+                var st = stat()
+                guard lstat(url.path, &st) == 0 else { continue }
+                if (st.st_flags & SF_DATALESS) != 0 {
+                    dataless += 1
+                } else if st.st_size > 0 {
+                    materialized += 1
+                }
+                if materialized + dataless >= 10000 { break }
             }
-            if materialized + dataless >= 10000 { break }
         }
 
         let total = materialized + dataless
@@ -285,26 +286,28 @@ private func collectEvictableURLs(
         options: [.skipsHiddenFiles]
     ) else { return [] }
 
-    let allURLs = enumerator.allObjects.compactMap { $0 as? URL }
     var result: [URL] = []
 
-    for url in allURLs {
-        guard url.lastPathComponent.hasPrefix(".") == false else { continue }
-        if isProtected(url: url, protectedPaths: protectedPaths) { continue }
+    // Lazy iteration — never materialize all URLs into an array (439K+ files)
+    autoreleasepool {
+        for case let url as URL in enumerator {
+            guard url.lastPathComponent.hasPrefix(".") == false else { continue }
+            if isProtected(url: url, protectedPaths: protectedPaths) { continue }
 
-        let values = try? url.resourceValues(forKeys: Set(keys))
+            let values = try? url.resourceValues(forKeys: Set(keys))
 
-        if requireMaterialized {
-            guard values?.isRegularFile == true else { continue }
-            guard values?.isUbiquitousItem == true else { continue }
-            guard values?.ubiquitousItemDownloadingStatus == .current
-                || values?.ubiquitousItemDownloadingStatus == .downloaded else { continue }
-        } else {
-            guard values?.isRegularFile == true else { continue }
-            guard values?.isUbiquitousItem == true else { continue }
+            if requireMaterialized {
+                guard values?.isRegularFile == true else { continue }
+                guard values?.isUbiquitousItem == true else { continue }
+                guard values?.ubiquitousItemDownloadingStatus == .current
+                    || values?.ubiquitousItemDownloadingStatus == .downloaded else { continue }
+            } else {
+                guard values?.isRegularFile == true else { continue }
+                guard values?.isUbiquitousItem == true else { continue }
+            }
+
+            result.append(url)
         }
-
-        result.append(url)
     }
 
     return result

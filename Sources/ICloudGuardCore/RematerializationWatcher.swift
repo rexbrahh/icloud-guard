@@ -34,7 +34,7 @@ public final class RematerializationWatcher {
 
         let metadataQuery = NSMetadataQuery()
         metadataQuery.searchScopes = [NSMetadataQueryUbiquitousDocumentsScope]
-        metadataQuery.predicate = NSPredicate(value: true)
+        metadataQuery.predicate = NSPredicate(format: "%K == %@", NSMetadataUbiquitousItemDownloadingStatusKey, URLUbiquitousItemDownloadingStatus.current.rawValue)
         metadataQuery.valueListAttributes = [
             NSMetadataUbiquitousItemDownloadingStatusKey,
             NSMetadataItemURLKey,
