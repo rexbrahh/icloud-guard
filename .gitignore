@@ -1,0 +1,8 @@
+.build/
+.swiftpm/
+*.xcodeproj/
+DerivedData/
+.build-nix/
+result
+.DS_Store
+ICloudGuard.app
