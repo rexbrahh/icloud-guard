@@ -1,0 +1,60 @@
+name: Beta Release (date+build-time versioning)
+
+on:
+  push:
+    branches: [beta]
+    tags:
+      - 'beta-*'
+
+jobs:
+  beta-release:
+    runs-on: macos-14
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode.app
+
+      - name: Build & Test
+        run: |
+          swift build --product ICloudGuard -c release
+          swift test
+
+      - name: Build .app bundle
+        run: ./scripts/build-app.sh --release
+
+      - name: Generate beta version
+        id: version
+        run: |
+          # Format: YYYY.MDD.HMMSS (e.g. 2026.704.50312 for July 4th, 5:03:12 AM)
+          NOW=$(date -u "+%Y.%-m%-d.%-H%-M%-S")
+          echo "version=$NOW" >> $GITHUB_OUTPUT
+          echo "Beta version: $NOW"
+
+      - name: Create zip
+        run: |
+          cd .build
+          zip -r ICloudGuard-beta-${{ steps.version.outputs.version }}.zip ICloudGuard.app
+
+      - name: Update Info.plist version
+        run: |
+          plutil -replace CFBundleShortVersionString -string "${{ steps.version.outputs.version }}" .build/ICloudGuard.app/Contents/Info.plist
+          plutil -replace CFBundleVersion -string "${{ github.run_number }}" .build/ICloudGuard.app/Contents/Info.plist
+
+      - name: Create beta release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: beta-${{ steps.version.outputs.version }}
+          name: Beta ${{ steps.version.outputs.version }}
+          prerelease: true
+          files: .build/ICloudGuard-beta-${{ steps.version.outputs.version }}.zip
+          body: |
+            Beta build with date+time versioning.
+
+            Version: ${{ steps.version.outputs.version }}
+            Build: ${{ github.run_number }}
+
+            Beta releases use the format YYYY.MDD.HMMSS for the version string.
+            These are not stable releases — expect rough edges.

@@ -1,0 +1,36 @@
+name: Release (Tagged)
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  release:
+    runs-on: macos-14
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode.app
+
+      - name: Build & Test
+        run: |
+          swift build --product ICloudGuard -c release
+          swift test
+
+      - name: Build .app bundle
+        run: ./scripts/build-app.sh --release
+
+      - name: Create zip
+        run: |
+          cd .build
+          zip -r ICloudGuard-${{ github.ref_name }}.zip ICloudGuard.app
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: .build/ICloudGuard-${{ github.ref_name }}.zip
+          generate_release_notes: true

@@ -7,6 +7,8 @@ import ICloudGuardCore
 actor GuardService {
     private let scopePath: String
     private let logger: Logger
+    private let config: AppConfig
+    private let configStore: ConfigStore
     private var suppression: DownloadSuppression?
     private var watcher: RematerializationWatcher?
     private var pollutionTimer: Timer?
@@ -17,14 +19,16 @@ actor GuardService {
         self.eventHandler = eventHandler
         let logPath = "\(NSHomeDirectory())/Library/Logs/icloud-guard.log"
         self.logger = Logger(logPath: logPath)
+        self.configStore = ConfigStore()
+        self.config = configStore.load()
     }
 
     func start() {
         // Layer 1: Apply download suppression
         let suppressionConfig = DownloadSuppressionConfig(
-            spotlightSuppression: true,
-            quickLookCacheClear: true,
-            materializeDatalessFiles: false,
+            spotlightSuppression: config.suppression.spotlight,
+            quickLookCacheClear: config.suppression.quicklook,
+            materializeDatalessFiles: config.suppression.materializeDataless,
             scopePath: scopePath
         )
         let supp = DownloadSuppression(config: suppressionConfig, logger: logger)
@@ -63,6 +67,7 @@ actor GuardService {
         let handler = eventHandler
         let scope = scopePath
         let log = logger
+        let batchLimit = config.eviction.batchLimit
         Task.detached {
             let fm = FileManager.default
             let scopeURL = URL(fileURLWithPath: NSString(string: scope).expandingTildeInPath, isDirectory: true)
@@ -94,7 +99,7 @@ actor GuardService {
                     failed += 1
                 }
 
-                if evicted + failed >= 500 { break }
+                if evicted + failed >= batchLimit { break }
             }
 
             log.log("eviction evicted=\(evicted) failed=\(failed)")
@@ -107,6 +112,7 @@ actor GuardService {
         let handler = eventHandler
         let scope = scopePath
         let log = logger
+        let panicLimit = config.eviction.panicLimit
         Task.detached {
             let fm = FileManager.default
             let scopeURL = URL(fileURLWithPath: NSString(string: scope).expandingTildeInPath, isDirectory: true)
@@ -136,7 +142,7 @@ actor GuardService {
                     failed += 1
                 }
 
-                if evicted + failed >= 2000 { break }
+                if evicted + failed >= panicLimit { break }
             }
 
             log.log("panic-eviction evicted=\(evicted) failed=\(failed)")
@@ -153,7 +159,8 @@ actor GuardService {
     }
 
     private func schedulePollutionCheck() {
-        let timer = Timer.scheduledTimer(withTimeInterval: 300.0, repeats: true) { [weak self] _ in
+        let interval = TimeInterval(config.watcher.pollutionCheckIntervalSeconds)
+        let timer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
             Task { await self?.checkPollution() }
         }
         pollutionTimer = timer

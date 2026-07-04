@@ -1,0 +1,55 @@
+name: Tip Release (every passing commit on tip branch)
+
+on:
+  push:
+    branches: [tip]
+
+jobs:
+  tip-release:
+    runs-on: macos-14
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode.app
+
+      - name: Build & Test
+        run: |
+          swift build --product ICloudGuard -c release
+          swift test
+
+      - name: Build .app bundle
+        run: ./scripts/build-app.sh --release
+
+      - name: Generate version
+        id: version
+        run: |
+          NOW=$(date -u "+%Y.%-m%-d.%-H%-M%-S")
+          echo "version=$NOW" >> $GITHUB_OUTPUT
+          echo "Version: $NOW"
+
+      - name: Create zip
+        run: |
+          cd .build
+          zip -r ICloudGuard-tip-${{ steps.version.outputs.version }}.zip ICloudGuard.app
+
+      - name: Delete previous tip prerelease
+        run: gh release delete tip --cleanup-tag --yes || true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create tip prerelease
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: tip
+          name: Tip Build (${{ steps.version.outputs.version }})
+          prerelease: true
+          files: .build/ICloudGuard-tip-${{ steps.version.outputs.version }}.zip
+          body: |
+            Automatically built from the latest `tip` branch commit.
+
+            Version: ${{ steps.version.outputs.version }}
+
+            This release is continuously updated. The previous tip build is replaced on every push.
