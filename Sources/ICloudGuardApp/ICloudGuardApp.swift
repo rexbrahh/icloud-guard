@@ -22,5 +22,6 @@ struct ICloudGuardApp: App {
         Settings {
             SettingsView(viewModel: viewModel)
         }
+        .windowResizability(.contentMinSize)
     }
 }
