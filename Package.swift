@@ -8,15 +8,26 @@ let package = Package(
     ],
     products: [
         .library(name: "ICloudGuardCore", targets: ["ICloudGuardCore"]),
-        .executable(name: "ICloudGuard", targets: ["ICloudGuardApp"]),
+        .executable(name: "icloud-guard", targets: ["ICloudGuardCLI"]),
+    ],
+    dependencies: [
+        .package(url: "https://github.com/apple/swift-argument-parser.git", from: "1.3.0"),
     ],
     targets: [
         .target(
             name: "ICloudGuardCore"
         ),
-        .executableTarget(
+        .target(
             name: "ICloudGuardApp",
             dependencies: ["ICloudGuardCore"],
+        ),
+        .executableTarget(
+            name: "ICloudGuardCLI",
+            dependencies: [
+                "ICloudGuardCore",
+                "ICloudGuardApp",
+                .product(name: "ArgumentParser", package: "swift-argument-parser"),
+            ],
         ),
         .testTarget(
             name: "ICloudGuardCoreTests",
