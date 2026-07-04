@@ -4,6 +4,7 @@ import ICloudGuardCore
 
 struct StatusBarView: View {
     @ObservedObject var viewModel: GuardViewModel
+    @Environment(\.openSettings) private var openSettings
     private let scopePath = "\(NSHomeDirectory())/Library/Mobile Documents/com~apple~CloudDocs"
 
     var body: some View {
@@ -110,10 +111,14 @@ struct StatusBarView: View {
 
             // Settings + Quit — full width
             Button {
-                NSApp.activate(ignoringOtherApps: true)
-                NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil)
+                if #available(macOS 14.0, *) {
+                    openSettings()
+                } else {
+                    NSApp.activate(ignoringOtherApps: true)
+                    NSApp.sendAction(Selector(("showPreferencesWindow:")), to: nil, from: nil)
+                }
             } label: {
-                Label("Settings…", systemImage: "gearshape")
+                Label("Settings", systemImage: "gearshape")
                     .frame(maxWidth: .infinity)
             }
             .buttonStyle(.plain)
