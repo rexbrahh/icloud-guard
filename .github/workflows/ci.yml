@@ -24,6 +24,9 @@ jobs:
       - name: Build .app bundle
         run: ./scripts/build-app.sh --release
 
+      - name: Memory leak guard
+        run: ./scripts/leak-guard.sh
+
       - name: Upload .app artifact
         uses: actions/upload-artifact@v4
         with:
