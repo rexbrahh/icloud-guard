@@ -19,7 +19,7 @@ jobs:
 
       - name: Build & Test
         run: |
-          swift build --product ICloudGuard -c release
+          swift build -c release
           swift test
 
       - name: Build .app bundle
@@ -28,10 +28,17 @@ jobs:
       - name: Generate beta version
         id: version
         run: |
-          # Format: YYYY.MDD.HMMSS (e.g. 2026.704.50312 for July 4th, 5:03:12 AM)
-          NOW=$(date -u "+%Y.%-m%-d.%-H%-M%-S")
-          echo "version=$NOW" >> $GITHUB_OUTPUT
-          echo "Beta version: $NOW"
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            # Tag-triggered: use the tag name minus the 'beta-' prefix as the version
+            VERSION="${GITHUB_REF_NAME#beta-}"
+            echo "Using tag-based version: $VERSION"
+          else
+            # Branch push: timestamp format YYYY.MDD.HMMSS (e.g. 2026.704.50312 for July 4th, 5:03:12 AM)
+            VERSION=$(date -u "+%Y.%-m%-d.%-H%-M%-S")
+            echo "Using timestamp-based version: $VERSION"
+          fi
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Beta version: $VERSION"
 
       - name: Create zip
         run: |
