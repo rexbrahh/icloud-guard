@@ -4,7 +4,7 @@ import ICloudGuardCore
 
 struct StatusBarView: View {
     @ObservedObject var viewModel: GuardViewModel
-    @Environment(\.openSettings) private var openSettings: OpenSettingsAction
+    // @Environment(\.openSettings) requires macOS 15+ SDK; use NSApp.sendAction instead
     @Environment(AppConfigModel.self) private var configModel
 
     var body: some View {
@@ -120,12 +120,8 @@ struct StatusBarView: View {
 
             // Settings + Quit — full width
             Button {
-                if #available(macOS 14.0, *) {
-                    openSettings()
-                } else {
-                    NSApp.activate(ignoringOtherApps: true)
-                    NSApp.sendAction(Selector(("showPreferencesWindow:")), to: nil, from: nil)
-                }
+                NSApp.activate(ignoringOtherApps: true)
+                NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil)
             } label: {
                 Label("Settings", systemImage: "gearshape")
                     .frame(maxWidth: .infinity)
