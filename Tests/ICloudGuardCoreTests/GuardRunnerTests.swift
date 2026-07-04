@@ -184,33 +184,19 @@ final class GuardRunnerTests: XCTestCase {
         let lockURL = rootURL.appendingPathComponent("run.lock")
         let stateURL = rootURL.appendingPathComponent("state.json")
         let logURL = rootURL.appendingPathComponent("icloud-guard.log")
-        let configURL = rootURL.appendingPathComponent("config.json")
+        let configURL = rootURL.appendingPathComponent("config.toml")
 
         try FileManager.default.createDirectory(at: scopeURL, withIntermediateDirectories: true)
-        let config = GuardConfig(
-            label: "org.nix-community.home.icloud-guard",
-            logPath: logURL.path,
-            lockPath: lockURL.path,
-            scopePath: scopeURL.path,
-            statePath: stateURL.path,
-            notifications: NotificationConfig(enable: false),
-            policy: PolicyConfig(
-                sampleIntervalSeconds: 300,
-                targetLocalGiB: 30,
-                trimLocalGiB: 35,
-                warnFreeGiB: 80,
-                remediateFreeGiB: 50,
-                panicFreeGiB: 25,
-                growthTriggerGiB: 20,
-                growthWindowMinutes: 10,
-                cooldownMinutes: 30,
-                protectedPaths: []
-            )
-        )
 
-        let encoder = JSONEncoder()
-        encoder.dateEncodingStrategy = .iso8601
-        try encoder.encode(config).write(to: configURL)
+        let appConfig = AppConfig(
+            suppression: .init(),
+            eviction: .init(batchLimit: 500, panicLimit: 2000),
+            watcher: .init(backoffMaxSeconds: 60, pollutionCheckIntervalSeconds: 300),
+            scope: .init(path: scopeURL.path, protectedPaths: []),
+            policy: .init()
+        )
+        let store = ConfigStore(configURL: configURL)
+        try store.save(appConfig)
 
         return (rootURL, configURL, lockURL, stateURL, logURL)
     }
@@ -221,10 +207,9 @@ final class GuardRunnerTests: XCTestCase {
         try encoder.encode(state).write(to: url)
     }
 
-    private func saveConfig(_ config: GuardConfig, to url: URL) throws {
-        let encoder = JSONEncoder()
-        encoder.dateEncodingStrategy = .iso8601
-        try encoder.encode(config).write(to: url)
+    private func saveConfig(_ config: AppConfig, to url: URL) throws {
+        let store = ConfigStore(configURL: url)
+        try store.save(config)
     }
 
     private func loadState(from url: URL) throws -> GuardState {
@@ -233,10 +218,9 @@ final class GuardRunnerTests: XCTestCase {
         return try decoder.decode(GuardState.self, from: Data(contentsOf: url))
     }
 
-    private func loadConfig(from url: URL) throws -> GuardConfig {
-        let decoder = JSONDecoder()
-        decoder.dateDecodingStrategy = .iso8601
-        return try decoder.decode(GuardConfig.self, from: Data(contentsOf: url))
+    private func loadConfig(from url: URL) throws -> AppConfig {
+        let store = ConfigStore(configURL: url)
+        return store.load()
     }
 
     private func snapshot(scopePath: String, relativePath: String, localGiB: Int) -> ICloudItemSnapshot {

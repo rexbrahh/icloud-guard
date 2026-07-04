@@ -328,15 +328,37 @@ public final class GuardRunner {
 
     private func loadConfig(path: String) throws -> GuardConfig {
         let url = URL(fileURLWithPath: NSString(string: path).expandingTildeInPath)
-        let data = try Data(contentsOf: url)
-        let decoder = JSONDecoder()
-        decoder.dateDecodingStrategy = .iso8601
-        return try decoder.decode(GuardConfig.self, from: data)
+        let store = ConfigStore(configURL: url)
+        let appConfig = store.load()
+        return mapConfig(appConfig, configURL: url)
     }
 
     private func defaultConfigPath() -> String {
-        let xdgPath = ProcessInfo.processInfo.environment["XDG_CONFIG_HOME"] ?? "\(NSHomeDirectory())/.config"
-        return "\(xdgPath)/r3x/icloud-guard/config.json"
+        return AppPaths.config.path
+    }
+
+    private func mapConfig(_ appConfig: AppConfig, configURL: URL) -> GuardConfig {
+        let dir = configURL.deletingLastPathComponent()
+        return GuardConfig(
+            label: "org.nix-community.home.icloud-guard",
+            logPath: dir.appendingPathComponent("icloud-guard.log").path,
+            lockPath: dir.appendingPathComponent("run.lock").path,
+            scopePath: appConfig.scope.path,
+            statePath: dir.appendingPathComponent("state.json").path,
+            notifications: NotificationConfig(enable: false),
+            policy: PolicyConfig(
+                sampleIntervalSeconds: appConfig.watcher.pollutionCheckIntervalSeconds,
+                targetLocalGiB: appConfig.policy.targetLocalGiB,
+                trimLocalGiB: appConfig.policy.trimLocalGiB,
+                warnFreeGiB: appConfig.policy.warnFreeGiB,
+                remediateFreeGiB: appConfig.policy.remediateFreeGiB,
+                panicFreeGiB: appConfig.policy.panicFreeGiB,
+                growthTriggerGiB: appConfig.policy.growthTriggerGiB,
+                growthWindowMinutes: appConfig.policy.growthWindowMinutes,
+                cooldownMinutes: appConfig.policy.cooldownMinutes,
+                protectedPaths: appConfig.scope.protectedPaths
+            )
+        )
     }
 
     private func withLock<T>(
@@ -517,6 +539,7 @@ public final class Logger: GuardLogging {
 
         do {
             try FileManager.default.createDirectory(at: logURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+            rotateIfNeeded()
             if !FileManager.default.fileExists(atPath: logURL.path) {
                 FileManager.default.createFile(atPath: logURL.path, contents: nil)
             }
@@ -530,7 +553,18 @@ public final class Logger: GuardLogging {
             fputs("[icloud-guard] failed to append to log: \(error)\n", stderr)
         }
     }
+
+    private func rotateIfNeeded() {
+        let attrs = try? FileManager.default.attributesOfItem(atPath: logURL.path)
+        let size = (attrs?[.size] as? NSNumber)?.int64Value ?? 0
+        if size >= 10 * 1024 * 1024 {
+            let backupPath = logURL.path + ".1"
+            try? FileManager.default.removeItem(atPath: backupPath)
+            try? FileManager.default.moveItem(atPath: logURL.path, toPath: backupPath)
+        }
+    }
 }
+
 
 private final class RunWatchdog {
     private let workItem: DispatchWorkItem

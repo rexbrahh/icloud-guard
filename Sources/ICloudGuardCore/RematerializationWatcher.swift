@@ -17,12 +17,15 @@ public final class RematerializationWatcher {
     private let maxBackoffSeconds: TimeInterval = 60.0
     private var lastRematerializationAt: Date?
     private var rematerializationCount: Int = 0
+    private let protectedPaths: [String]
 
     public var onRematerialization: ((RematerializationEvent) -> Void)?
 
     public init(logger: GuardLogging, evictorFactory: @escaping (GuardLogging) -> ICloudEvicting) {
         self.logger = logger
         self.evictorFactory = evictorFactory
+        self.protectedPaths = ConfigStore().load().scope.protectedPaths
+
     }
 
     /// Start watching for rematerialization of iCloud Drive items.
@@ -80,7 +83,14 @@ public final class RematerializationWatcher {
 
     private func handleRematerialization(url: URL, newStatus: String) {
         let now = Date()
+
         rematerializationCount += 1
+
+        let path = url.path
+        if protectedPaths.contains(where: { path.hasPrefix($0) }) {
+            logger.log("watcher skip-rematerialize path=\(path) reason=protected")
+            return
+        }
 
         let event = RematerializationEvent(
             itemPath: url.path,
