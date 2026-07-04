@@ -120,7 +120,7 @@ actor GuardService {
             let timer = DispatchSource.makeTimerSource(queue: DispatchQueue.global(qos: .utility))
             timer.schedule(deadline: .now() + .seconds(interval), repeating: .seconds(interval))
             timer.setEventHandler { [weak self] in
-                Task { await self?.checkPollution() }
+                Task { [weak self] in await self?.checkPollution() }
             }
             timer.resume()
             pollutionTimer = timer
@@ -238,7 +238,7 @@ actor GuardService {
         let timer = DispatchSource.makeTimerSource(queue: DispatchQueue.global(qos: .utility))
         timer.schedule(deadline: .now() + .seconds(interval), repeating: .seconds(interval))
         timer.setEventHandler { [weak self] in
-            Task { await self?.checkPollution() }
+            Task { [weak self] in await self?.checkPollution() }
         }
         timer.resume()
         pollutionTimer = timer
