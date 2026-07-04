@@ -1,4 +1,5 @@
 import Foundation
+import Network
 import ICloudGuardCore
 
 /// Lightweight background guard service.
@@ -12,6 +13,8 @@ actor GuardService {
     private var suppression: DownloadSuppression?
     private var watcher: RematerializationWatcher?
     private var pollutionTimer: Timer?
+    private var networkMonitor: NWPathMonitor?
+    private var networkEvictionDispatched = false
     private let eventHandler: (GuardServiceEvent) -> Void
 
     init(scopePath: String, eventHandler: @escaping (GuardServiceEvent) -> Void) {
@@ -48,13 +51,18 @@ actor GuardService {
         watcher = w
         eventHandler(.watcherStarted)
 
-        // Lightweight pollution check every 5 minutes (cheap stat scan, no content reads)
+        // Network change detection → auto-evict after settle
+        startNetworkMonitor()
+
+        // Lightweight pollution check (cheap stat scan, no content reads)
         schedulePollutionCheck()
     }
 
     func stop() {
         pollutionTimer?.invalidate()
         pollutionTimer = nil
+        networkMonitor?.cancel()
+        networkMonitor = nil
         watcher?.stop()
         watcher = nil
         suppression?.removeSpotlightSuppression()
@@ -62,44 +70,36 @@ actor GuardService {
         eventHandler(.watcherStopped)
     }
 
+    // MARK: - Eviction
+
     func runEviction() {
         eventHandler(.evictionStarted)
         let handler = eventHandler
         let scope = scopePath
         let log = logger
         let batchLimit = config.eviction.batchLimit
-        Task.detached {
-            let fm = FileManager.default
-            let scopeURL = URL(fileURLWithPath: NSString(string: scope).expandingTildeInPath, isDirectory: true)
+        let protectedPaths = config.scope.protectedPaths
 
-            guard let enumerator = fm.enumerator(
-                at: scopeURL,
-                includingPropertiesForKeys: [.isRegularFileKey, .isUbiquitousItemKey, .ubiquitousItemDownloadingStatusKey],
-                options: [.skipsHiddenFiles]
-            ) else {
-                handler(.evictionCompleted)
-                handler(.error("failed to enumerate iCloud Drive"))
-                return
-            }
+        Task.detached {
+            let urls = collectEvictableURLs(
+                scopePath: scope,
+                keys: [.isRegularFileKey, .isUbiquitousItemKey, .ubiquitousItemDownloadingStatusKey],
+                protectedPaths: protectedPaths,
+                requireMaterialized: true
+            )
 
             var evicted = 0
             var failed = 0
+            let fm = FileManager.default
 
-            for case let url as URL in enumerator {
-                guard url.lastPathComponent.hasPrefix(".") == false else { continue }
-                let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .isUbiquitousItemKey, .ubiquitousItemDownloadingStatusKey])
-                guard values?.isRegularFile == true else { continue }
-                guard values?.isUbiquitousItem == true else { continue }
-                guard values?.ubiquitousItemDownloadingStatus == .current || values?.ubiquitousItemDownloadingStatus == .downloaded else { continue }
-
+            for url in urls {
+                guard evicted + failed < batchLimit else { break }
                 do {
                     try fm.evictUbiquitousItem(at: url)
                     evicted += 1
                 } catch {
                     failed += 1
                 }
-
-                if evicted + failed >= batchLimit { break }
             }
 
             log.log("eviction evicted=\(evicted) failed=\(failed)")
@@ -113,36 +113,28 @@ actor GuardService {
         let scope = scopePath
         let log = logger
         let panicLimit = config.eviction.panicLimit
-        Task.detached {
-            let fm = FileManager.default
-            let scopeURL = URL(fileURLWithPath: NSString(string: scope).expandingTildeInPath, isDirectory: true)
+        let protectedPaths = config.scope.protectedPaths
 
-            guard let enumerator = fm.enumerator(
-                at: scopeURL,
-                includingPropertiesForKeys: [.isRegularFileKey, .isUbiquitousItemKey],
-                options: [.skipsHiddenFiles]
-            ) else {
-                handler(.evictionCompleted)
-                handler(.error("failed to enumerate iCloud Drive"))
-                return
-            }
+        Task.detached {
+            let urls = collectEvictableURLs(
+                scopePath: scope,
+                keys: [.isRegularFileKey, .isUbiquitousItemKey],
+                protectedPaths: protectedPaths,
+                requireMaterialized: false
+            )
 
             var evicted = 0
             var failed = 0
+            let fm = FileManager.default
 
-            for case let url as URL in enumerator {
-                guard url.lastPathComponent.hasPrefix(".") == false else { continue }
-                let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .isUbiquitousItemKey])
-                guard values?.isRegularFile == true, values?.isUbiquitousItem == true else { continue }
-
+            for url in urls {
+                guard evicted + failed < panicLimit else { break }
                 do {
                     try fm.evictUbiquitousItem(at: url)
                     evicted += 1
                 } catch {
                     failed += 1
                 }
-
-                if evicted + failed >= panicLimit { break }
             }
 
             log.log("panic-eviction evicted=\(evicted) failed=\(failed)")
@@ -150,13 +142,28 @@ actor GuardService {
         }
     }
 
-    private func completeEviction() {
-        eventHandler(.evictionCompleted)
+    // MARK: - Network Change Detection
+
+    private func startNetworkMonitor() {
+        let monitor = NWPathMonitor()
+        monitor.pathUpdateHandler = { [weak self] path in
+            guard let self else { return }
+
+            if path.status == .satisfied && !self.networkEvictionDispatched {
+                self.networkEvictionDispatched = true
+                // Wait 30s for bird to settle after reconnection, then evict
+                Task {
+                    try? await Task.sleep(nanoseconds: 30_000_000_000)
+                    await self.runEviction()
+                    self.networkEvictionDispatched = false
+                }
+            }
+        }
+        monitor.start(queue: DispatchQueue.global(qos: .utility))
+        networkMonitor = monitor
     }
 
-    private func handleRematerialization(_ event: RematerializationEvent) {
-        eventHandler(.rematerializationDetected(event))
-    }
+    // MARK: - Pollution Check
 
     private func schedulePollutionCheck() {
         let interval = TimeInterval(config.watcher.pollutionCheckIntervalSeconds)
@@ -164,12 +171,9 @@ actor GuardService {
             Task { await self?.checkPollution() }
         }
         pollutionTimer = timer
-        // Initial check
         Task { await checkPollution() }
     }
 
-    /// Cheap stat-based pollution check. Uses lstat to count SF_DATALESS vs materialized files.
-    /// No content reads, no NSFileCoordinator, no materialization triggers.
     private func checkPollution() {
         let scopeURL = URL(fileURLWithPath: NSString(string: scopePath).expandingTildeInPath, isDirectory: true)
         var materialized = 0
@@ -181,7 +185,10 @@ actor GuardService {
             options: [.skipsHiddenFiles]
         ) else { return }
 
-        for case let url as URL in enumerator {
+        // Collect URLs synchronously to avoid Swift 6 makeIterator issue
+        let allURLs = enumerator.allObjects.compactMap { $0 as? URL }
+
+        for url in allURLs {
             guard url.lastPathComponent.hasPrefix(".") == false else { continue }
             var st = stat()
             guard lstat(url.path, &st) == 0 else { continue }
@@ -190,10 +197,71 @@ actor GuardService {
             } else if st.st_size > 0 {
                 materialized += 1
             }
-            // Cap at 10000 for snappiness
             if materialized + dataless >= 10000 { break }
         }
 
         eventHandler(.pollutionUpdated(materialized: materialized, dataless: dataless))
     }
+
+    // MARK: - Private
+
+    private func handleRematerialization(_ event: RematerializationEvent) {
+        eventHandler(.rematerializationDetected(event))
+    }
+}
+
+// MARK: - URL Collection Helper
+
+/// Collects evictable URLs synchronously from the iCloud Drive scope.
+/// Separated from async context to avoid Swift 6 `makeIterator` warnings.
+private func collectEvictableURLs(
+    scopePath: String,
+    keys: [URLResourceKey],
+    protectedPaths: [String],
+    requireMaterialized: Bool
+) -> [URL] {
+    let scopeURL = URL(fileURLWithPath: NSString(string: scopePath).expandingTildeInPath, isDirectory: true)
+
+    guard let enumerator = FileManager.default.enumerator(
+        at: scopeURL,
+        includingPropertiesForKeys: keys,
+        options: [.skipsHiddenFiles]
+    ) else { return [] }
+
+    let allURLs = enumerator.allObjects.compactMap { $0 as? URL }
+    var result: [URL] = []
+
+    for url in allURLs {
+        guard url.lastPathComponent.hasPrefix(".") == false else { continue }
+
+        // Check protected paths
+        if isProtected(url: url, protectedPaths: protectedPaths) { continue }
+
+        let values = try? url.resourceValues(forKeys: Set(keys))
+
+        if requireMaterialized {
+            guard values?.isRegularFile == true else { continue }
+            guard values?.isUbiquitousItem == true else { continue }
+            guard values?.ubiquitousItemDownloadingStatus == .current
+                || values?.ubiquitousItemDownloadingStatus == .downloaded else { continue }
+        } else {
+            guard values?.isRegularFile == true else { continue }
+            guard values?.isUbiquitousItem == true else { continue }
+        }
+
+        result.append(url)
+    }
+
+    return result
+}
+
+private func isProtected(url: URL, protectedPaths: [String]) -> Bool {
+    let path = url.path
+    for protected in protectedPaths {
+        let expanded = NSString(string: protected).expandingTildeInPath
+        if path == expanded || path.hasPrefix(expanded + "/") {
+            return true
+        }
+    }
+    return false
 }

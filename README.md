@@ -122,13 +122,6 @@ the dropdown shows:
 - **panic evict** — evict everything up to the panic limit (default 2000 files)
 - **settings** — or press cmd+, when the popover is open
 
-## ci/cd
-
-- **`main` branch** — build + test on every push
-- **`v*` tags** — auto-create a github release with the `.app` bundle
-- **`tip` branch** — every passing commit auto-replaces the tip prerelease
-- **`beta` branch** — date+build-time versioned prereleases (e.g. `2026.704.50312` for july 4th, 5:03:12 am)
-
 ## acknowledgments
 
 - [howard oakley (eclectic light)](https://eclecticlight.co/) — for documenting the sonoma fileprovider eviction regression and the `com.apple.fileprovider.pinned` xattr mechanism
