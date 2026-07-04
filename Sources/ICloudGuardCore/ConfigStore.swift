@@ -28,17 +28,20 @@ public struct AppConfig: Equatable, Sendable {
     public var eviction: EvictionConfig
     public var watcher: WatcherConfig
     public var scope: ScopeConfig
+    public var policy: PolicyConfig
 
     public init(
         suppression: SuppressionConfig = .init(),
         eviction: EvictionConfig = .init(),
         watcher: WatcherConfig = .init(),
-        scope: ScopeConfig = .init()
+        scope: ScopeConfig = .init(),
+        policy: PolicyConfig = .init()
     ) {
         self.suppression = suppression
         self.eviction = eviction
         self.watcher = watcher
         self.scope = scope
+        self.policy = policy
     }
 
     public struct SuppressionConfig: Equatable, Sendable, Codable {
@@ -82,6 +85,37 @@ public struct AppConfig: Equatable, Sendable {
             self.protectedPaths = protectedPaths
         }
     }
+
+    public struct PolicyConfig: Equatable, Sendable, Codable {
+        public var targetLocalGiB: Int
+        public var trimLocalGiB: Int
+        public var warnFreeGiB: Int
+        public var remediateFreeGiB: Int
+        public var panicFreeGiB: Int
+        public var cooldownMinutes: Int
+        public var growthTriggerGiB: Int
+        public var growthWindowMinutes: Int
+
+        public init(
+            targetLocalGiB: Int = 30,
+            trimLocalGiB: Int = 35,
+            warnFreeGiB: Int = 80,
+            remediateFreeGiB: Int = 50,
+            panicFreeGiB: Int = 25,
+            cooldownMinutes: Int = 30,
+            growthTriggerGiB: Int = 20,
+            growthWindowMinutes: Int = 10
+        ) {
+            self.targetLocalGiB = targetLocalGiB
+            self.trimLocalGiB = trimLocalGiB
+            self.warnFreeGiB = warnFreeGiB
+            self.remediateFreeGiB = remediateFreeGiB
+            self.panicFreeGiB = panicFreeGiB
+            self.cooldownMinutes = cooldownMinutes
+            self.growthTriggerGiB = growthTriggerGiB
+            self.growthWindowMinutes = growthWindowMinutes
+        }
+    }
 }
 
 /// Minimal TOML reader/writer for simple flat key-value config sections.
@@ -118,6 +152,7 @@ public final class ConfigStore {
         var eviction = AppConfig.EvictionConfig()
         var watcher = AppConfig.WatcherConfig()
         var scope = AppConfig.ScopeConfig()
+        var policy = AppConfig.PolicyConfig()
 
         var currentSection = ""
 
@@ -164,11 +199,23 @@ public final class ConfigStore {
                     scope.protectedPaths = parseStringArray(rawValue)
                 default: break
                 }
+            case "policy":
+                switch key {
+                case "target_local_gib": policy.targetLocalGiB = parseInt(rawValue) ?? 30
+                case "trim_local_gib": policy.trimLocalGiB = parseInt(rawValue) ?? 35
+                case "warn_free_gib": policy.warnFreeGiB = parseInt(rawValue) ?? 80
+                case "remediate_free_gib": policy.remediateFreeGiB = parseInt(rawValue) ?? 50
+                case "panic_free_gib": policy.panicFreeGiB = parseInt(rawValue) ?? 25
+                case "cooldown_minutes": policy.cooldownMinutes = parseInt(rawValue) ?? 30
+                case "growth_trigger_gib": policy.growthTriggerGiB = parseInt(rawValue) ?? 20
+                case "growth_window_minutes": policy.growthWindowMinutes = parseInt(rawValue) ?? 10
+                default: break
+                }
             default: break
             }
         }
 
-        return AppConfig(suppression: suppression, eviction: eviction, watcher: watcher, scope: scope)
+        return AppConfig(suppression: suppression, eviction: eviction, watcher: watcher, scope: scope, policy: policy)
     }
 
     private func parseBool(_ value: String) -> Bool {
@@ -213,6 +260,16 @@ public final class ConfigStore {
         lines.append("path = \"\(config.scope.path)\"")
         let paths = config.scope.protectedPaths.map { "\"\($0)\"" }.joined(separator: ", ")
         lines.append("protected_paths = [\(paths)]")
+        lines.append("")
+        lines.append("[policy]")
+        lines.append("target_local_gib = \(config.policy.targetLocalGiB)")
+        lines.append("trim_local_gib = \(config.policy.trimLocalGiB)")
+        lines.append("warn_free_gib = \(config.policy.warnFreeGiB)")
+        lines.append("remediate_free_gib = \(config.policy.remediateFreeGiB)")
+        lines.append("panic_free_gib = \(config.policy.panicFreeGiB)")
+        lines.append("cooldown_minutes = \(config.policy.cooldownMinutes)")
+        lines.append("growth_trigger_gib = \(config.policy.growthTriggerGiB)")
+        lines.append("growth_window_minutes = \(config.policy.growthWindowMinutes)")
         lines.append("")
         return lines.joined(separator: "\n")
     }
