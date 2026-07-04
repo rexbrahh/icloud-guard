@@ -121,6 +121,10 @@ final class GuardRunnerTests: XCTestCase {
     func testRunRecordsFailedEvictionCountWhenProviderRefusesEviction() throws {
         let sandbox = try makeSandbox()
         let scopePath = sandbox.rootURL.appendingPathComponent("CloudDocs").path
+        // Override remediateFreeGiB to trigger targeted eviction with mock data (40 GiB free < 50 GiB threshold)
+        var config = try loadConfig(from: sandbox.configURL)
+        config.policy.remediateFreeGiB = 50
+        try saveConfig(config, to: sandbox.configURL)
         let candidate = snapshot(scopePath: scopePath, relativePath: "Resident.bin", localGiB: 2)
         let scanner = MockScanner(
             usageScans: [
@@ -193,7 +197,7 @@ final class GuardRunnerTests: XCTestCase {
             eviction: .init(batchLimit: 500, panicLimit: 2000),
             watcher: .init(backoffMaxSeconds: 60, pollutionCheckIntervalSeconds: 300),
             scope: .init(path: scopeURL.path, protectedPaths: []),
-            policy: .init()
+            policy: .init(targetLocalGiB: 30, trimLocalGiB: 35, warnFreeGiB: 0, remediateFreeGiB: 0, panicFreeGiB: 0, cooldownMinutes: 30, growthTriggerGiB: 20, growthWindowMinutes: 10)
         )
         let store = ConfigStore(configURL: configURL)
         try store.save(appConfig)
