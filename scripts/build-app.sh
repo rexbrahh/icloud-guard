@@ -11,8 +11,9 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
-APP_NAME="ICloudGuard"
-BUNDLE_NAME="ICloudGuard.app"
+APP_NAME="icloud-guard"        # SPM product/binary name
+BUNDLE_BINARY="ICloudGuard"    # Binary name inside .app bundle
+BUNDLE_NAME="ICloudGuard.app"  # .app bundle name
 CONFIGURATION="debug"
 INSTALL=false
 
@@ -57,7 +58,7 @@ rm -rf "$APP_BUNDLE"
 mkdir -p "$APP_BUNDLE/Contents/MacOS"
 mkdir -p "$APP_BUNDLE/Contents/Resources"
 
-cp "$BINARY_PATH" "$APP_BUNDLE/Contents/MacOS/$APP_NAME"
+cp "$BINARY_PATH" "$APP_BUNDLE/Contents/MacOS/$BUNDLE_BINARY"
 cp "$PROJECT_DIR/Sources/ICloudGuardApp/Resources/Info.plist" "$APP_BUNDLE/Contents/Info.plist"
 # Copy app icon if it exists
 if [[ -f "$PROJECT_DIR/Sources/ICloudGuardApp/Resources/AppIcon.icns" ]]; then
@@ -79,4 +80,19 @@ if [[ "$INSTALL" == true ]]; then
     cp -R "$APP_BUNDLE" "$INSTALL_DIR/"
     echo "Installed to: $INSTALL_DIR/$BUNDLE_NAME"
     echo "Launch with: open $INSTALL_DIR/$BUNDLE_NAME"
+fi
+
+# Install CLI wrapper to ~/bin
+if [[ "$INSTALL" == true ]]; then
+    BIN_DIR="$HOME/bin"
+    mkdir -p "$BIN_DIR"
+    CLI_WRAPPER="$BIN_DIR/icloud-guard"
+    cat > "$CLI_WRAPPER" << 'WRAPPER'
+#!/bin/bash
+# iCloud Guard CLI wrapper — execs the .app bundle binary
+exec "$HOME/Applications/ICloudGuard.app/Contents/MacOS/ICloudGuard" "$@"
+WRAPPER
+    chmod +x "$CLI_WRAPPER"
+    echo "CLI wrapper installed to: $CLI_WRAPPER"
+    echo "Add ~/bin to your PATH if not already there."
 fi
