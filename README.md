@@ -14,7 +14,7 @@ the actual mechanism, traced from system logs (`log show --predicate 'process ==
 
 this speculative download behavior is controlled by apple's [trial (a/b testing) system](https://developer.apple.com/documentation/technotes/tn3150-getting-ready-for-data-less-files) under a namespace called `COREOS_FPFS_SPECULATIVE_DOWNLOADS` — the logs show `Namespace COREOS_FPFS_SPECULATIVE_DOWNLOADS does not provide a factor with name "speculativeDownloadSetCompressedAge"` — meaning apple can turn it on or off per user from their servers, without any macos update, and without your consent or knowledge. there is no user-facing toggle for this. you can't turn it off in system settings. you can't turn it off with a `defaults write` command. it just is.
 
-it also doesnt help that both [spotlight](https://support.apple.com/guide/mac-help/spotlight-mchlp1008/mac) indexing service and [finder](https://en.wikipedia.org/wiki/Finder_(software)) app both run an eager enumerator on icloud root on mac so nothing regarding icloud, on your mac, ever truly rests even if you barely even touch it. the `fileproviderctl dump` output shows spotlight (pid 3191) holding an active enumerator on `icloud/root` and finder (pid 718) holding enumerators on the file system and trash — both of which can trigger materialization of [dataless files](https://developer.apple.com/documentation/technotes/tn3150-getting-ready-for-data-less-files) (evicted files that exist as apfs stubs with the `SF_DATALESS` flag, `0x40000000`, zero allocated blocks but nonzero logical size).
+it also doesnt help that both [spotlight](https://support.apple.com/guide/mac-help/spotlight-mchlp1008/mac) indexing service and [finder](https://en.wikipedia.org/wiki/Finder_(software)) app both run an eager enumerator on icloud root on mac so nothing regarding icloud, on your mac, ever truly rests even if you barely even touch it. the `fileproviderctl dump` output shows spotlight process holding an active enumerator on `icloud/root` and finder process holding enumerators on the file system and trash — both of which can trigger materialization of [dataless files](https://developer.apple.com/documentation/technotes/tn3150-getting-ready-for-data-less-files) (evicted files that exist as apfs stubs with the `SF_DATALESS` flag, `0x40000000`, zero allocated blocks but nonzero logical size).
 
 there are threads of multiple people on forums with the same problem:
 
@@ -111,6 +111,10 @@ path = "~/Library/Mobile Documents/com~apple~CloudDocs"
 ```
 
 all app files live under `~/.icloud-guard/` — config, logs, future state. nothing in `~/Library/Application Support/` or `~/Library/Logs/`.
+
+### gh releases
+
+tip and beta releases are available in this repo. tip releases are built from every tip commit that lands on main that passes CI, builds and gets packaged successfully. beta releases are more polished, sporadic, when i think it's good enough for a certain standard with respect to goals i set for myself on this tool. you can find them in releases in this gh repo.
 
 ## the menu bar
 

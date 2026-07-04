@@ -1,4 +1,5 @@
 import SwiftUI
+import ServiceManagement
 import ICloudGuardCore
 
 struct SettingsView: View {
@@ -13,7 +14,7 @@ struct SettingsView: View {
             AboutView()
                 .tabItem { Label("About", systemImage: "info.circle") }
         }
-        .frame(width: 460, height: 420)
+        .frame(width: 460, height: 480)
     }
 }
 
@@ -33,6 +34,17 @@ private struct GeneralSettingsView: View {
                         .font(.headline)
                     Toggle("Launch at login", isOn: $runAtLogin)
                         .toggleStyle(.switch)
+                        .onChange(of: runAtLogin) { _, enabled in
+                            do {
+                                if enabled {
+                                    try SMAppService.mainApp.register()
+                                } else {
+                                    try SMAppService.mainApp.unregister()
+                                }
+                            } catch {
+                                runAtLogin = !enabled
+                            }
+                        }
                     Toggle("Notifications", isOn: $notificationsEnabled)
                         .toggleStyle(.switch)
                 }
@@ -88,14 +100,49 @@ private struct GeneralSettingsView: View {
 }
 
 private struct PolicySettingsView: View {
+    @AppStorage("targetLocalGiB") private var targetLocalGiB = 10
+    @AppStorage("trimLocalGiB") private var trimLocalGiB = 15
+    @AppStorage("warnFreeGiB") private var warnFreeGiB = 100
+    @AppStorage("remediateFreeGiB") private var remediateFreeGiB = 80
+    @AppStorage("panicFreeGiB") private var panicFreeGiB = 50
+    @AppStorage("cooldownMinutes") private var cooldownMinutes = 2
     @AppStorage("evictionBatchLimit") private var evictionBatchLimit = 500
     @AppStorage("panicBatchLimit") private var panicBatchLimit = 2000
     @AppStorage("pollutionCheckIntervalSeconds") private var pollutionCheckInterval = 300
     @AppStorage("watcherBackoffMaxSeconds") private var watcherBackoffMax = 60
+    @State private var newProtectedPath = ""
+    @AppStorage("protectedPaths") private var protectedPathsData = Data()
+
+    private var protectedPaths: [String] {
+        get { (try? JSONDecoder().decode([String].self, from: protectedPathsData)) ?? [] }
+    }
+
+    private func saveProtectedPaths(_ paths: [String]) {
+        protectedPathsData = (try? JSONEncoder().encode(paths)) ?? Data()
+    }
 
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
+                Group {
+                    Text("Local iCloud Thresholds")
+                        .font(.headline)
+                    Stepper("Target local: \(targetLocalGiB) GiB", value: $targetLocalGiB, in: 1...200)
+                    Stepper("Trim trigger: \(trimLocalGiB) GiB", value: $trimLocalGiB, in: 1...300)
+                }
+
+                Divider()
+
+                Group {
+                    Text("Free Space Thresholds")
+                        .font(.headline)
+                    Stepper("Warn at: \(warnFreeGiB) GiB free", value: $warnFreeGiB, in: 10...500)
+                    Stepper("Remediate at: \(remediateFreeGiB) GiB free", value: $remediateFreeGiB, in: 10...500)
+                    Stepper("Panic at: \(panicFreeGiB) GiB free", value: $panicFreeGiB, in: 5...500)
+                }
+
+                Divider()
+
                 Group {
                     Text("Eviction Limits")
                         .font(.headline)
@@ -108,8 +155,49 @@ private struct PolicySettingsView: View {
                 Group {
                     Text("Timing")
                         .font(.headline)
+                    Stepper("Cooldown: \(cooldownMinutes)min", value: $cooldownMinutes, in: 1...120)
                     Stepper("Pollution check: \(pollutionCheckInterval)s", value: $pollutionCheckInterval, in: 60...3600, step: 60)
                     Stepper("Watcher backoff max: \(watcherBackoffMax)s", value: $watcherBackoffMax, in: 10...300, step: 10)
+                }
+
+                Divider()
+
+                Group {
+                    Text("Protected Paths")
+                        .font(.headline)
+                    Text("Files in these paths will never be evicted.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    HStack {
+                        TextField("iCloud Drive path…", text: $newProtectedPath)
+                            .textFieldStyle(.roundedBorder)
+                        Button("Add") {
+                            let trimmed = newProtectedPath.trimmingCharacters(in: .whitespaces)
+                            guard !trimmed.isEmpty else { return }
+                            var paths = protectedPaths
+                            paths.append(trimmed)
+                            saveProtectedPaths(paths)
+                            newProtectedPath = ""
+                        }
+                    }
+                    ForEach(protectedPaths, id: \.self) { path in
+                        HStack {
+                            Text(path)
+                                .font(.caption)
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                            Spacer()
+                            Button {
+                                var paths = protectedPaths
+                                paths.removeAll { $0 == path }
+                                saveProtectedPaths(paths)
+                            } label: {
+                                Image(systemName: "minus.circle")
+                                    .foregroundStyle(.secondary)
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
                 }
             }
             .padding(20)

@@ -2,9 +2,6 @@ import Foundation
 import Network
 import ICloudGuardCore
 
-/// Lightweight background guard service.
-/// Does NOT use GuardRunner (which requires a config.json file).
-/// Instead, directly manages suppression, watcher, and pollution metrics.
 actor GuardService {
     private let scopePath: String
     private let logger: Logger
@@ -27,7 +24,6 @@ actor GuardService {
     }
 
     func start() {
-        // Layer 1: Apply download suppression
         let suppressionConfig = DownloadSuppressionConfig(
             spotlightSuppression: config.suppression.spotlight,
             quickLookCacheClear: config.suppression.quicklook,
@@ -39,7 +35,6 @@ actor GuardService {
         suppression = supp
         eventHandler(.suppressionApplied)
 
-        // Layer 3: Start rematerialization watcher
         let w = RematerializationWatcher(
             logger: logger,
             evictorFactory: { logger in PackageAwareEvictor(logger: logger) }
@@ -51,10 +46,7 @@ actor GuardService {
         watcher = w
         eventHandler(.watcherStarted)
 
-        // Network change detection → auto-evict after settle
         startNetworkMonitor()
-
-        // Lightweight pollution check (cheap stat scan, no content reads)
         schedulePollutionCheck()
     }
 
@@ -69,8 +61,6 @@ actor GuardService {
         suppression = nil
         eventHandler(.watcherStopped)
     }
-
-    // MARK: - Eviction
 
     func runEviction() {
         eventHandler(.evictionStarted)
@@ -142,28 +132,31 @@ actor GuardService {
         }
     }
 
-    // MARK: - Network Change Detection
+    private func handleRematerialization(_ event: RematerializationEvent) {
+        eventHandler(.rematerializationDetected(event))
+    }
 
     private func startNetworkMonitor() {
         let monitor = NWPathMonitor()
         monitor.pathUpdateHandler = { [weak self] path in
-            guard let self else { return }
-
-            if path.status == .satisfied && !self.networkEvictionDispatched {
-                self.networkEvictionDispatched = true
-                // Wait 30s for bird to settle after reconnection, then evict
-                Task {
-                    try? await Task.sleep(nanoseconds: 30_000_000_000)
-                    await self.runEviction()
-                    self.networkEvictionDispatched = false
-                }
+            guard path.status == .satisfied else { return }
+            Task { [weak self] in
+                guard let self else { return }
+                let already = await self.networkEvictionDispatched
+                guard !already else { return }
+                await self.setNetworkDispatched(true)
+                try? await Task.sleep(nanoseconds: 30_000_000_000)
+                await self.runEviction()
+                await self.setNetworkDispatched(false)
             }
         }
         monitor.start(queue: DispatchQueue.global(qos: .utility))
         networkMonitor = monitor
     }
 
-    // MARK: - Pollution Check
+    private func setNetworkDispatched(_ value: Bool) {
+        networkEvictionDispatched = value
+    }
 
     private func schedulePollutionCheck() {
         let interval = TimeInterval(config.watcher.pollutionCheckIntervalSeconds)
@@ -185,7 +178,6 @@ actor GuardService {
             options: [.skipsHiddenFiles]
         ) else { return }
 
-        // Collect URLs synchronously to avoid Swift 6 makeIterator issue
         let allURLs = enumerator.allObjects.compactMap { $0 as? URL }
 
         for url in allURLs {
@@ -202,18 +194,8 @@ actor GuardService {
 
         eventHandler(.pollutionUpdated(materialized: materialized, dataless: dataless))
     }
-
-    // MARK: - Private
-
-    private func handleRematerialization(_ event: RematerializationEvent) {
-        eventHandler(.rematerializationDetected(event))
-    }
 }
 
-// MARK: - URL Collection Helper
-
-/// Collects evictable URLs synchronously from the iCloud Drive scope.
-/// Separated from async context to avoid Swift 6 `makeIterator` warnings.
 private func collectEvictableURLs(
     scopePath: String,
     keys: [URLResourceKey],
@@ -233,8 +215,6 @@ private func collectEvictableURLs(
 
     for url in allURLs {
         guard url.lastPathComponent.hasPrefix(".") == false else { continue }
-
-        // Check protected paths
         if isProtected(url: url, protectedPaths: protectedPaths) { continue }
 
         let values = try? url.resourceValues(forKeys: Set(keys))

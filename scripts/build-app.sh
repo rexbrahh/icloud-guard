@@ -59,6 +59,10 @@ mkdir -p "$APP_BUNDLE/Contents/Resources"
 
 cp "$BINARY_PATH" "$APP_BUNDLE/Contents/MacOS/$APP_NAME"
 cp "$PROJECT_DIR/Sources/ICloudGuardApp/Resources/Info.plist" "$APP_BUNDLE/Contents/Info.plist"
+# Copy app icon if it exists
+if [[ -f "$PROJECT_DIR/Sources/ICloudGuardApp/Resources/AppIcon.icns" ]]; then
+    cp "$PROJECT_DIR/Sources/ICloudGuardApp/Resources/AppIcon.icns" "$APP_BUNDLE/Contents/Resources/AppIcon.icns"
+fi
 
 # Ad-hoc code signing (required for notifications and hardened runtime)
 codesign --sign - --force --deep "$APP_BUNDLE" 2>/dev/null || {

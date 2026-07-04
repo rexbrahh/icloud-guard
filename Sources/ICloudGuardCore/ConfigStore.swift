@@ -75,9 +75,11 @@ public struct AppConfig: Equatable, Sendable {
 
     public struct ScopeConfig: Equatable, Sendable, Codable {
         public var path: String
+        public var protectedPaths: [String]
 
-        public init(path: String = "~/Library/Mobile Documents/com~apple~CloudDocs") {
+        public init(path: String = "~/Library/Mobile Documents/com~apple~CloudDocs", protectedPaths: [String] = []) {
             self.path = path
+            self.protectedPaths = protectedPaths
         }
     }
 }
@@ -158,6 +160,8 @@ public final class ConfigStore {
                 case "path":
                     let unquoted = rawValue.replacingOccurrences(of: "\"", with: "")
                     scope.path = unquoted
+                case "protected_paths":
+                    scope.protectedPaths = parseStringArray(rawValue)
                 default: break
                 }
             default: break
@@ -173,6 +177,16 @@ public final class ConfigStore {
 
     private func parseInt(_ value: String) -> Int? {
         Int(value)
+    }
+
+    private func parseStringArray(_ value: String) -> [String] {
+        // Parse ["path1", "path2"] format
+        var stripped = value
+        if stripped.hasPrefix("[") { stripped = String(stripped.dropFirst()) }
+        if stripped.hasSuffix("]") { stripped = String(stripped.dropLast()) }
+        return stripped.split(separator: ",").map {
+            $0.trimmingCharacters(in: .whitespaces).replacingOccurrences(of: "\"", with: "")
+        }.filter { !$0.isEmpty }
     }
 
     // MARK: - Minimal TOML Serializer
@@ -197,6 +211,8 @@ public final class ConfigStore {
         lines.append("")
         lines.append("[scope]")
         lines.append("path = \"\(config.scope.path)\"")
+        let paths = config.scope.protectedPaths.map { "\"\($0)\"" }.joined(separator: ", ")
+        lines.append("protected_paths = [\(paths)]")
         lines.append("")
         return lines.joined(separator: "\n")
     }
