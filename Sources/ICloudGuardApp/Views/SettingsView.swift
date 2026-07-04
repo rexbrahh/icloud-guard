@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 import ServiceManagement
 import ICloudGuardCore
@@ -22,9 +23,7 @@ private struct GeneralSettingsView: View {
     @ObservedObject var viewModel: GuardViewModel
     @AppStorage("runAtLogin") private var runAtLogin = true
     @AppStorage("notificationsEnabled") private var notificationsEnabled = true
-    @AppStorage("spotlightSuppression") private var spotlightSuppression = true
-    @AppStorage("quickLookCacheClear") private var quickLookCacheClear = true
-    @AppStorage("materializeDatalessFiles") private var materializeDatalessFiles = false
+    @Environment(AppConfigModel.self) private var configModel
 
     var body: some View {
         ScrollView {
@@ -54,11 +53,11 @@ private struct GeneralSettingsView: View {
                 Group {
                     Text("Download Suppression")
                         .font(.headline)
-                    Toggle("Spotlight indexing of iCloud Drive", isOn: $spotlightSuppression)
+                    Toggle("Spotlight indexing of iCloud Drive", isOn: Binding(get: { configModel.config.suppression.spotlight }, set: { configModel.updateSuppression(.init(spotlight: $0, quicklook: configModel.config.suppression.quicklook, materializeDataless: configModel.config.suppression.materializeDataless)) }))
                         .toggleStyle(.switch)
-                    Toggle("QuickLook cache clearing", isOn: $quickLookCacheClear)
+                    Toggle("QuickLook cache clearing", isOn: Binding(get: { configModel.config.suppression.quicklook }, set: { configModel.updateSuppression(.init(spotlight: configModel.config.suppression.spotlight, quicklook: $0, materializeDataless: configModel.config.suppression.materializeDataless)) }))
                         .toggleStyle(.switch)
-                    Toggle("Non-materializing I/O policy", isOn: $materializeDatalessFiles)
+                    Toggle("Non-materializing I/O policy", isOn: Binding(get: { configModel.config.suppression.materializeDataless }, set: { configModel.updateSuppression(.init(spotlight: configModel.config.suppression.spotlight, quicklook: configModel.config.suppression.quicklook, materializeDataless: $0)) }))
                         .toggleStyle(.switch)
                 }
 
@@ -100,25 +99,13 @@ private struct GeneralSettingsView: View {
 }
 
 private struct PolicySettingsView: View {
-    @AppStorage("targetLocalGiB") private var targetLocalGiB = 10
-    @AppStorage("trimLocalGiB") private var trimLocalGiB = 15
-    @AppStorage("warnFreeGiB") private var warnFreeGiB = 100
-    @AppStorage("remediateFreeGiB") private var remediateFreeGiB = 80
-    @AppStorage("panicFreeGiB") private var panicFreeGiB = 50
-    @AppStorage("cooldownMinutes") private var cooldownMinutes = 2
-    @AppStorage("evictionBatchLimit") private var evictionBatchLimit = 500
-    @AppStorage("panicBatchLimit") private var panicBatchLimit = 2000
-    @AppStorage("pollutionCheckIntervalSeconds") private var pollutionCheckInterval = 300
-    @AppStorage("watcherBackoffMaxSeconds") private var watcherBackoffMax = 60
+    @Environment(AppConfigModel.self) private var configModel
     @State private var newProtectedPath = ""
-    @AppStorage("protectedPaths") private var protectedPathsData = Data()
 
-    private var protectedPaths: [String] {
-        get { (try? JSONDecoder().decode([String].self, from: protectedPathsData)) ?? [] }
-    }
+    private var protectedPaths: [String] { configModel.config.scope.protectedPaths }
 
     private func saveProtectedPaths(_ paths: [String]) {
-        protectedPathsData = (try? JSONEncoder().encode(paths)) ?? Data()
+        configModel.updateScope(.init(path: configModel.config.scope.path, protectedPaths: paths))
     }
 
     var body: some View {
@@ -127,8 +114,8 @@ private struct PolicySettingsView: View {
                 Group {
                     Text("Local iCloud Thresholds")
                         .font(.headline)
-                    Stepper("Target local: \(targetLocalGiB) GiB", value: $targetLocalGiB, in: 1...200)
-                    Stepper("Trim trigger: \(trimLocalGiB) GiB", value: $trimLocalGiB, in: 1...300)
+                    Stepper("Target local: \(configModel.config.policy.targetLocalGiB) GiB", value: Binding(get: { configModel.config.policy.targetLocalGiB }, set: { configModel.updatePolicy(.init(targetLocalGiB: $0, trimLocalGiB: configModel.config.policy.trimLocalGiB, warnFreeGiB: configModel.config.policy.warnFreeGiB, remediateFreeGiB: configModel.config.policy.remediateFreeGiB, panicFreeGiB: configModel.config.policy.panicFreeGiB, cooldownMinutes: configModel.config.policy.cooldownMinutes, growthTriggerGiB: configModel.config.policy.growthTriggerGiB, growthWindowMinutes: configModel.config.policy.growthWindowMinutes)) }), in: 1...200)
+                    Stepper("Trim trigger: \(configModel.config.policy.trimLocalGiB) GiB", value: Binding(get: { configModel.config.policy.trimLocalGiB }, set: { configModel.updatePolicy(.init(targetLocalGiB: configModel.config.policy.targetLocalGiB, trimLocalGiB: $0, warnFreeGiB: configModel.config.policy.warnFreeGiB, remediateFreeGiB: configModel.config.policy.remediateFreeGiB, panicFreeGiB: configModel.config.policy.panicFreeGiB, cooldownMinutes: configModel.config.policy.cooldownMinutes, growthTriggerGiB: configModel.config.policy.growthTriggerGiB, growthWindowMinutes: configModel.config.policy.growthWindowMinutes)) }), in: 1...300)
                 }
 
                 Divider()
@@ -136,9 +123,9 @@ private struct PolicySettingsView: View {
                 Group {
                     Text("Free Space Thresholds")
                         .font(.headline)
-                    Stepper("Warn at: \(warnFreeGiB) GiB free", value: $warnFreeGiB, in: 10...500)
-                    Stepper("Remediate at: \(remediateFreeGiB) GiB free", value: $remediateFreeGiB, in: 10...500)
-                    Stepper("Panic at: \(panicFreeGiB) GiB free", value: $panicFreeGiB, in: 5...500)
+                    Stepper("Warn at: \(configModel.config.policy.warnFreeGiB) GiB free", value: Binding(get: { configModel.config.policy.warnFreeGiB }, set: { configModel.updatePolicy(.init(targetLocalGiB: configModel.config.policy.targetLocalGiB, trimLocalGiB: configModel.config.policy.trimLocalGiB, warnFreeGiB: $0, remediateFreeGiB: configModel.config.policy.remediateFreeGiB, panicFreeGiB: configModel.config.policy.panicFreeGiB, cooldownMinutes: configModel.config.policy.cooldownMinutes, growthTriggerGiB: configModel.config.policy.growthTriggerGiB, growthWindowMinutes: configModel.config.policy.growthWindowMinutes)) }), in: 10...500)
+                    Stepper("Remediate at: \(configModel.config.policy.remediateFreeGiB) GiB free", value: Binding(get: { configModel.config.policy.remediateFreeGiB }, set: { configModel.updatePolicy(.init(targetLocalGiB: configModel.config.policy.targetLocalGiB, trimLocalGiB: configModel.config.policy.trimLocalGiB, warnFreeGiB: configModel.config.policy.warnFreeGiB, remediateFreeGiB: $0, panicFreeGiB: configModel.config.policy.panicFreeGiB, cooldownMinutes: configModel.config.policy.cooldownMinutes, growthTriggerGiB: configModel.config.policy.growthTriggerGiB, growthWindowMinutes: configModel.config.policy.growthWindowMinutes)) }), in: 10...500)
+                    Stepper("Panic at: \(configModel.config.policy.panicFreeGiB) GiB free", value: Binding(get: { configModel.config.policy.panicFreeGiB }, set: { configModel.updatePolicy(.init(targetLocalGiB: configModel.config.policy.targetLocalGiB, trimLocalGiB: configModel.config.policy.trimLocalGiB, warnFreeGiB: configModel.config.policy.warnFreeGiB, remediateFreeGiB: configModel.config.policy.remediateFreeGiB, panicFreeGiB: $0, cooldownMinutes: configModel.config.policy.cooldownMinutes, growthTriggerGiB: configModel.config.policy.growthTriggerGiB, growthWindowMinutes: configModel.config.policy.growthWindowMinutes)) }), in: 5...500)
                 }
 
                 Divider()
@@ -146,8 +133,8 @@ private struct PolicySettingsView: View {
                 Group {
                     Text("Eviction Limits")
                         .font(.headline)
-                    Stepper("Batch limit: \(evictionBatchLimit) files", value: $evictionBatchLimit, in: 50...5000, step: 50)
-                    Stepper("Panic limit: \(panicBatchLimit) files", value: $panicBatchLimit, in: 100...10000, step: 100)
+                    Stepper("Batch limit: \(configModel.config.eviction.batchLimit) files", value: Binding(get: { configModel.config.eviction.batchLimit }, set: { configModel.updateEviction(.init(batchLimit: $0, panicLimit: configModel.config.eviction.panicLimit)) }), in: 50...5000, step: 50)
+                    Stepper("Panic limit: \(configModel.config.eviction.panicLimit) files", value: Binding(get: { configModel.config.eviction.panicLimit }, set: { configModel.updateEviction(.init(batchLimit: configModel.config.eviction.batchLimit, panicLimit: $0)) }), in: 100...10000, step: 100)
                 }
 
                 Divider()
@@ -155,9 +142,9 @@ private struct PolicySettingsView: View {
                 Group {
                     Text("Timing")
                         .font(.headline)
-                    Stepper("Cooldown: \(cooldownMinutes)min", value: $cooldownMinutes, in: 1...120)
-                    Stepper("Pollution check: \(pollutionCheckInterval)s", value: $pollutionCheckInterval, in: 60...3600, step: 60)
-                    Stepper("Watcher backoff max: \(watcherBackoffMax)s", value: $watcherBackoffMax, in: 10...300, step: 10)
+                    Stepper("Cooldown: \(configModel.config.policy.cooldownMinutes)min", value: Binding(get: { configModel.config.policy.cooldownMinutes }, set: { configModel.updatePolicy(.init(targetLocalGiB: configModel.config.policy.targetLocalGiB, trimLocalGiB: configModel.config.policy.trimLocalGiB, warnFreeGiB: configModel.config.policy.warnFreeGiB, remediateFreeGiB: configModel.config.policy.remediateFreeGiB, panicFreeGiB: configModel.config.policy.panicFreeGiB, cooldownMinutes: $0, growthTriggerGiB: configModel.config.policy.growthTriggerGiB, growthWindowMinutes: configModel.config.policy.growthWindowMinutes)) }), in: 1...120)
+                    Stepper("Pollution check: \(configModel.config.watcher.pollutionCheckIntervalSeconds)s", value: Binding(get: { configModel.config.watcher.pollutionCheckIntervalSeconds }, set: { configModel.updateWatcher(.init(backoffMaxSeconds: configModel.config.watcher.backoffMaxSeconds, pollutionCheckIntervalSeconds: $0)) }), in: 60...3600, step: 60)
+                    Stepper("Watcher backoff max: \(configModel.config.watcher.backoffMaxSeconds)s", value: Binding(get: { configModel.config.watcher.backoffMaxSeconds }, set: { configModel.updateWatcher(.init(backoffMaxSeconds: $0, pollutionCheckIntervalSeconds: configModel.config.watcher.pollutionCheckIntervalSeconds)) }), in: 10...300, step: 10)
                 }
 
                 Divider()
@@ -171,6 +158,16 @@ private struct PolicySettingsView: View {
                     HStack {
                         TextField("iCloud Drive path…", text: $newProtectedPath)
                             .textFieldStyle(.roundedBorder)
+                        Button("Browse…") {
+                            let panel = NSOpenPanel()
+                            panel.canChooseDirectories = true
+                            panel.canChooseFiles = false
+                            panel.allowsMultipleSelection = false
+                            panel.directoryURL = URL(fileURLWithPath: newProtectedPath.isEmpty ? NSHomeDirectory() : (newProtectedPath as NSString).expandingTildeInPath)
+                            if panel.runModal() == .OK, let url = panel.url {
+                                newProtectedPath = url.path
+                            }
+                        }
                         Button("Add") {
                             let trimmed = newProtectedPath.trimmingCharacters(in: .whitespaces)
                             guard !trimmed.isEmpty else { return }
@@ -219,7 +216,7 @@ private struct AboutView: View {
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
                 .frame(maxWidth: 320)
-            Text("Version 0.2.0")
+            Text("Version 0.3.0")
                 .font(.caption2)
                 .foregroundStyle(.tertiary)
         }

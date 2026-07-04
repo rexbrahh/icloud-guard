@@ -10,6 +10,7 @@ final class GuardViewModel: ObservableObject {
     @Published var lastRematerializationPath: String?
     @Published var lastRematerializationTime: Date?
     @Published var isEvicting = false
+    @Published var isPaused = false
     @Published var lastError: String?
 
     // Lightweight iCloud pollution metric: ratio of materialized vs dataless files
@@ -20,6 +21,7 @@ final class GuardViewModel: ObservableObject {
     private var guardService: GuardService?
 
     var statusIcon: String {
+        if isPaused { return "icloud.slash" }
         if isEvicting { return "arrow.2.circlepath" }
         if let err = lastError, !err.isEmpty { return "exclamationmark.icloud" }
         if pollutionRatio > 0.5 { return "icloud.and.arrow.down" }
@@ -28,6 +30,7 @@ final class GuardViewModel: ObservableObject {
     }
 
     var statusText: String {
+        if isPaused { return "Paused" }
         if isEvicting { return "Evicting…" }
         if let err = lastError, !err.isEmpty { return "Error" }
         if !suppressionActive && !watcherActive { return "Inactive" }
@@ -91,6 +94,15 @@ final class GuardViewModel: ObservableObject {
 
     func panicEvict() {
         Task { await guardService?.panicEvict() }
+    }
+
+    func togglePause() {
+        isPaused.toggle()
+        if isPaused {
+            Task { await guardService?.pause() }
+        } else {
+            Task { await guardService?.resume() }
+        }
     }
 }
 

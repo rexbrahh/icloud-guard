@@ -5,7 +5,7 @@ import ICloudGuardCore
 struct StatusBarView: View {
     @ObservedObject var viewModel: GuardViewModel
     @Environment(\.openSettings) private var openSettings
-    private let scopePath = "\(NSHomeDirectory())/Library/Mobile Documents/com~apple~CloudDocs"
+    @Environment(AppConfigModel.self) private var configModel
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -94,7 +94,7 @@ struct StatusBarView: View {
                     .frame(maxWidth: .infinity)
             }
             .buttonStyle(.plain)
-            .disabled(viewModel.isEvicting)
+            .disabled(viewModel.isEvicting || viewModel.isPaused)
             .padding(.vertical, 2)
 
             Button {
@@ -104,7 +104,16 @@ struct StatusBarView: View {
                     .frame(maxWidth: .infinity)
             }
             .buttonStyle(.plain)
-            .disabled(viewModel.isEvicting)
+            .disabled(viewModel.isEvicting || viewModel.isPaused)
+            .padding(.vertical, 2)
+
+            Button {
+                viewModel.togglePause()
+            } label: {
+                Label(viewModel.isPaused ? "Resume" : "Pause", systemImage: viewModel.isPaused ? "play.circle" : "pause.circle")
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.plain)
             .padding(.vertical, 2)
 
             Divider()
@@ -139,7 +148,7 @@ struct StatusBarView: View {
         .padding(12)
         .frame(width: 260)
         .onAppear {
-            viewModel.startGuardService(scopePath: scopePath)
+            viewModel.startGuardService(scopePath: configModel.config.scope.path)
         }
     }
 }
