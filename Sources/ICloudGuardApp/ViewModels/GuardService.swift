@@ -5,20 +5,24 @@ import ICloudGuardCore
 actor GuardService {
     private let scopePath: String
     private let logger: Logger
-    private let config: AppConfig
+    private let evictionLogger: Logger
+    private var config: AppConfig
     private let configStore: ConfigStore
     private var suppression: DownloadSuppression?
     private var watcher: RematerializationWatcher?
     private var pollutionTimer: Timer?
     private var networkMonitor: NWPathMonitor?
     private var networkEvictionDispatched = false
+    private var isPaused = false
     private let eventHandler: (GuardServiceEvent) -> Void
 
     init(scopePath: String, eventHandler: @escaping (GuardServiceEvent) -> Void) {
         AppPaths.ensureHomeDir()
+        AppPaths.seedDefaultConfigIfMissing()
         self.scopePath = scopePath
         self.eventHandler = eventHandler
         self.logger = Logger(logPath: AppPaths.log.path)
+        self.evictionLogger = Logger(logPath: AppPaths.evictionLog.path)
         self.configStore = ConfigStore()
         self.config = configStore.load()
     }
@@ -62,11 +66,72 @@ actor GuardService {
         eventHandler(.watcherStopped)
     }
 
+    func pause() {
+        isPaused = true
+        pollutionTimer?.invalidate()
+        pollutionTimer = nil
+        networkMonitor?.cancel()
+        networkMonitor = nil
+        watcher?.stop()
+        watcher = nil
+        eventHandler(.watcherStopped)
+    }
+
+    func resume() {
+        isPaused = false
+        let w = RematerializationWatcher(
+            logger: logger,
+            evictorFactory: { logger in PackageAwareEvictor(logger: logger) }
+        )
+        w.onRematerialization = { [weak self] event in
+            Task { await self?.handleRematerialization(event) }
+        }
+        w.start()
+        watcher = w
+        eventHandler(.watcherStarted)
+        startNetworkMonitor()
+        schedulePollutionCheck()
+    }
+
+    /// Reload config from disk and re-apply if changed.
+    /// Called when AppConfigModel.onChange fires after a config mutation.
+    func reloadConfig() {
+        let newConfig = configStore.load()
+        let oldConfig = config
+
+        // Re-apply suppression if its settings changed
+        if newConfig.suppression != oldConfig.suppression {
+            suppression?.removeSpotlightSuppression()
+            let suppressionConfig = DownloadSuppressionConfig(
+                spotlightSuppression: newConfig.suppression.spotlight,
+                quickLookCacheClear: newConfig.suppression.quicklook,
+                materializeDatalessFiles: newConfig.suppression.materializeDataless,
+                scopePath: scopePath
+            )
+            let supp = DownloadSuppression(config: suppressionConfig, logger: logger)
+            supp.apply()
+            suppression = supp
+        }
+
+        // Reschedule pollution timer if its interval changed
+        if newConfig.watcher.pollutionCheckIntervalSeconds != oldConfig.watcher.pollutionCheckIntervalSeconds {
+            pollutionTimer?.invalidate()
+            let interval = TimeInterval(newConfig.watcher.pollutionCheckIntervalSeconds)
+            pollutionTimer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
+                Task { [weak self] in await self?.checkPollution() }
+            }
+        }
+
+        // Update the stored config
+        config = newConfig
+    }
+
     func runEviction() {
         eventHandler(.evictionStarted)
         let handler = eventHandler
         let scope = scopePath
         let log = logger
+        let evLog = evictionLogger
         let batchLimit = config.eviction.batchLimit
         let protectedPaths = config.scope.protectedPaths
 
@@ -93,6 +158,8 @@ actor GuardService {
             }
 
             log.log("eviction evicted=\(evicted) failed=\(failed)")
+            evLog.log("eviction command=evict evicted=\(evicted) failed=\(failed) reclaimed=0")
+            await Notifier.shared.notifyEvictionComplete(evictedCount: evicted, reclaimedBytes: 0)
             handler(.evictionCompleted)
         }
     }
@@ -102,6 +169,7 @@ actor GuardService {
         let handler = eventHandler
         let scope = scopePath
         let log = logger
+        let evLog = evictionLogger
         let panicLimit = config.eviction.panicLimit
         let protectedPaths = config.scope.protectedPaths
 
@@ -127,12 +195,14 @@ actor GuardService {
                 }
             }
 
-            log.log("panic-eviction evicted=\(evicted) failed=\(failed)")
+            evLog.log("eviction command=panic-evict evicted=\(evicted) failed=\(failed) reclaimed=0")
+            await Notifier.shared.notifyEvictionComplete(evictedCount: evicted, reclaimedBytes: 0)
             handler(.evictionCompleted)
         }
     }
 
-    private func handleRematerialization(_ event: RematerializationEvent) {
+    private func handleRematerialization(_ event: RematerializationEvent) async {
+        await Notifier.shared.notifyRematerialization(path: event.itemPath)
         eventHandler(.rematerializationDetected(event))
     }
 
@@ -167,7 +237,7 @@ actor GuardService {
         Task { await checkPollution() }
     }
 
-    private func checkPollution() {
+    private func checkPollution() async {
         let scopeURL = URL(fileURLWithPath: NSString(string: scopePath).expandingTildeInPath, isDirectory: true)
         var materialized = 0
         var dataless = 0
@@ -192,6 +262,11 @@ actor GuardService {
             if materialized + dataless >= 10000 { break }
         }
 
+        let total = materialized + dataless
+        let pollutionRatio = total > 0 ? Double(dataless) / Double(total) : 0
+        if pollutionRatio > 0.7 {
+            await Notifier.shared.notifyPollutionThreshold(ratio: pollutionRatio)
+        }
         eventHandler(.pollutionUpdated(materialized: materialized, dataless: dataless))
     }
 }
