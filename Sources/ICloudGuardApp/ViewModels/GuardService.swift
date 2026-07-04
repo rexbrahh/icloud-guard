@@ -10,7 +10,7 @@ actor GuardService {
     private let configStore: ConfigStore
     private var suppression: DownloadSuppression?
     private var watcher: RematerializationWatcher?
-    private var pollutionTimer: Timer?
+    private var pollutionTimer: DispatchSourceTimer?
     private var networkMonitor: NWPathMonitor?
     private var networkEvictionDispatched = false
     private var isPaused = false
@@ -55,7 +55,7 @@ actor GuardService {
     }
 
     func stop() {
-        pollutionTimer?.invalidate()
+        pollutionTimer?.cancel()
         pollutionTimer = nil
         networkMonitor?.cancel()
         networkMonitor = nil
@@ -68,7 +68,7 @@ actor GuardService {
 
     func pause() {
         isPaused = true
-        pollutionTimer?.invalidate()
+        pollutionTimer?.cancel()
         pollutionTimer = nil
         networkMonitor?.cancel()
         networkMonitor = nil
@@ -115,12 +115,17 @@ actor GuardService {
 
         // Reschedule pollution timer if its interval changed
         if newConfig.watcher.pollutionCheckIntervalSeconds != oldConfig.watcher.pollutionCheckIntervalSeconds {
-            pollutionTimer?.invalidate()
-            let interval = TimeInterval(newConfig.watcher.pollutionCheckIntervalSeconds)
-            pollutionTimer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
-                Task { [weak self] in await self?.checkPollution() }
+            pollutionTimer?.cancel()
+            let interval = newConfig.watcher.pollutionCheckIntervalSeconds
+            let timer = DispatchSource.makeTimerSource(queue: DispatchQueue.global(qos: .utility))
+            timer.schedule(deadline: .now() + .seconds(interval), repeating: .seconds(interval))
+            timer.setEventHandler { [weak self] in
+                Task { await self?.checkPollution() }
             }
+            timer.resume()
+            pollutionTimer = timer
         }
+
 
         // Update the stored config
         config = newConfig
@@ -229,10 +234,13 @@ actor GuardService {
     }
 
     private func schedulePollutionCheck() {
-        let interval = TimeInterval(config.watcher.pollutionCheckIntervalSeconds)
-        let timer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
+        let interval = config.watcher.pollutionCheckIntervalSeconds
+        let timer = DispatchSource.makeTimerSource(queue: DispatchQueue.global(qos: .utility))
+        timer.schedule(deadline: .now() + .seconds(interval), repeating: .seconds(interval))
+        timer.setEventHandler { [weak self] in
             Task { await self?.checkPollution() }
         }
+        timer.resume()
         pollutionTimer = timer
         Task { await checkPollution() }
     }
