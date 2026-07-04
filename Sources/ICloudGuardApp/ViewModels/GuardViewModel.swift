@@ -13,20 +13,50 @@ final class GuardViewModel: ObservableObject {
     @Published var isPaused = false
     @Published var lastError: String?
 
-    // Lightweight iCloud pollution metric: ratio of materialized vs dataless files
+    // Pollution metrics
     @Published var materializedCount = 0
     @Published var datalessCount = 0
     @Published var pollutionRatio: Double = 0
+    @Published var freeSpaceBytes: Int64 = 0
+
+    // Lifetime stats
+    @Published var lifetimeEvictedCount: Int = 0
+    @Published var lifetimeReclaimedBytes: Int64 = 0
+
+    // Top folders by local space
+    @Published var topFolders: [(name: String, bytes: Int64)] = []
 
     private var guardService: GuardService?
+
+    init() {
+        loadLifetimeStats()
+    }
+
+    // MARK: - Status
 
     var statusIcon: String {
         if isPaused { return "icloud.slash" }
         if isEvicting { return "arrow.2.circlepath" }
-        if let err = lastError, !err.isEmpty { return "exclamationmark.icloud" }
-        if pollutionRatio > 0.5 { return "icloud.and.arrow.down" }
+        if let err = lastError, !err.isEmpty { return "exclamationmark.icloud.fill" }
+        if isCriticalDisk { return "exclamationmark.icloud.fill" }
+        if pollutionRatio > 0.7 { return "icloud.fill" }
+        if pollutionRatio > 0.3 { return "icloud.and.arrow.down" }
         if rematerializationCount > 0 { return "icloud.and.arrow.up" }
         return "icloud"
+    }
+
+    var statusIconColor: Color {
+        if isPaused { return .secondary }
+        if isEvicting { return .primary }
+        if let err = lastError, !err.isEmpty { return .red }
+        if isCriticalDisk { return .red }
+        if pollutionRatio > 0.7 { return .orange }
+        return .primary
+    }
+
+    var isCriticalDisk: Bool {
+        let freeGiB = Double(freeSpaceBytes) / (1024 * 1024 * 1024)
+        return freeGiB > 0 && freeGiB < 25
     }
 
     var statusText: String {
@@ -40,13 +70,28 @@ final class GuardViewModel: ObservableObject {
         return "Idle"
     }
 
-    /// Simple pollution gauge: how many iCloud files are locally materialized vs dataless.
-    /// 0.0 = everything evicted (clean), 1.0 = everything downloaded (polluted).
     var pollutionLabel: String {
         if materializedCount == 0 && datalessCount == 0 { return "—" }
         let pct = Int(pollutionRatio * 100)
         return "\(materializedCount) materialized / \(datalessCount) evicted (\(pct)% polluted)"
     }
+
+    var freeSpaceLabel: String {
+        let f = ByteCountFormatter()
+        f.allowedUnits = [.useGB, .useMB]
+        f.countStyle = .file
+        return f.string(fromByteCount: freeSpaceBytes)
+    }
+
+    var lifetimeLabel: String {
+        let f = ByteCountFormatter()
+        f.allowedUnits = [.useGB, .useMB, .useKB]
+        f.countStyle = .file
+        let reclaimed = f.string(fromByteCount: lifetimeReclaimedBytes)
+        return "\(lifetimeEvictedCount) files, \(reclaimed) reclaimed"
+    }
+
+    // MARK: - Service
 
     func startGuardService(scopePath: String) {
         guard guardService == nil else { return }
@@ -80,11 +125,17 @@ final class GuardViewModel: ObservableObject {
         case .error(let message):
             lastError = message
             isEvicting = false
-        case .pollutionUpdated(let materialized, let dataless):
+        case .pollutionUpdated(let materialized, let dataless, let freeSpace, let folders):
             materializedCount = materialized
             datalessCount = dataless
+            freeSpaceBytes = freeSpace
             let total = materialized + dataless
             pollutionRatio = total > 0 ? Double(materialized) / Double(total) : 0
+            topFolders = folders
+        case .evictionResult(let evicted, let reclaimed):
+            lifetimeEvictedCount += evicted
+            lifetimeReclaimedBytes += reclaimed
+            saveLifetimeStats()
         }
     }
 
@@ -96,12 +147,41 @@ final class GuardViewModel: ObservableObject {
         Task { await guardService?.panicEvict() }
     }
 
+    func previewEviction() {
+        Task { await guardService?.previewEviction() }
+    }
+
+    func evictFolder(_ folderPath: String) {
+        Task { await guardService?.evictFolder(folderPath) }
+    }
+
     func togglePause() {
         isPaused.toggle()
         if isPaused {
             Task { await guardService?.pause() }
         } else {
             Task { await guardService?.resume() }
+        }
+    }
+
+    // MARK: - Lifetime Stats Persistence
+
+    private func loadLifetimeStats() {
+        let url = AppPaths.homeDir.appendingPathComponent("lifetime.json")
+        guard let data = try? Data(contentsOf: url),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
+        lifetimeEvictedCount = json["evictedCount"] as? Int ?? 0
+        lifetimeReclaimedBytes = Int64(json["reclaimedBytes"] as? Int ?? 0)
+    }
+
+    private func saveLifetimeStats() {
+        let url = AppPaths.homeDir.appendingPathComponent("lifetime.json")
+        let json: [String: Any] = [
+            "evictedCount": lifetimeEvictedCount,
+            "reclaimedBytes": Int(lifetimeReclaimedBytes),
+        ]
+        if let data = try? JSONSerialization.data(withJSONObject: json, options: [.prettyPrinted]) {
+            try? data.write(to: url, options: [.atomic])
         }
     }
 }
@@ -114,5 +194,6 @@ enum GuardServiceEvent {
     case evictionStarted
     case evictionCompleted
     case error(String)
-    case pollutionUpdated(materialized: Int, dataless: Int)
+    case pollutionUpdated(materialized: Int, dataless: Int, freeSpace: Int64, folders: [(name: String, bytes: Int64)])
+    case evictionResult(evicted: Int, reclaimed: Int64)
 }
