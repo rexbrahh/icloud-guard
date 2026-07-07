@@ -40,16 +40,7 @@ actor GuardService {
         suppression = supp
         eventHandler(.suppressionApplied)
 
-        let w = RematerializationWatcher(
-            logger: logger,
-            evictorFactory: { logger in PackageAwareEvictor(logger: logger) }
-        )
-        w.onRematerializationBatch = { [weak self] events in
-            Task { [weak self] in await self?.handleRematerializationBatch(events) }
-        }
-        w.start()
-        watcher = w
-        eventHandler(.watcherStarted)
+        startRematerializationWatcherIfEnabled(using: config)
 
         startNetworkMonitor()
         schedulePollutionCheck()
@@ -60,8 +51,7 @@ actor GuardService {
         pollutionTimer = nil
         networkMonitor?.cancel()
         networkMonitor = nil
-        watcher?.stop()
-        watcher = nil
+        stopRematerializationWatcher()
         suppression?.removeSpotlightSuppression()
         suppression = nil
         eventHandler(.watcherStopped)
@@ -74,24 +64,14 @@ actor GuardService {
         pollutionTimer = nil
         networkMonitor?.cancel()
         networkMonitor = nil
-        watcher?.stop()
-        watcher = nil
+        stopRematerializationWatcher()
         eventHandler(.watcherStopped)
     }
 
     func resume() {
         isPaused = false
         isEvicting = false
-        let w = RematerializationWatcher(
-            logger: logger,
-            evictorFactory: { logger in PackageAwareEvictor(logger: logger) }
-        )
-        w.onRematerializationBatch = { [weak self] events in
-            Task { [weak self] in await self?.handleRematerializationBatch(events) }
-        }
-        w.start()
-        watcher = w
-        eventHandler(.watcherStarted)
+        startRematerializationWatcherIfEnabled(using: config)
         startNetworkMonitor()
         schedulePollutionCheck()
     }
@@ -111,6 +91,13 @@ actor GuardService {
             let supp = DownloadSuppression(config: suppressionConfig, logger: logger)
             supp.apply()
             suppression = supp
+        }
+
+        if newConfig.watcher.metadataWatcherEnabled != oldConfig.watcher.metadataWatcherEnabled
+            || newConfig.watcher.backoffMaxSeconds != oldConfig.watcher.backoffMaxSeconds
+        {
+            stopRematerializationWatcher()
+            startRematerializationWatcherIfEnabled(using: newConfig)
         }
 
         if newConfig.watcher.pollutionCheckIntervalSeconds != oldConfig.watcher.pollutionCheckIntervalSeconds {
@@ -154,24 +141,21 @@ actor GuardService {
                 includingPropertiesForKeys: [.isRegularFileKey, .isUbiquitousItemKey, .ubiquitousItemDownloadingStatusKey],
                 options: [.skipsHiddenFiles]
             ) {
-                for case let url as URL in enumerator {
-                    autoreleasepool {
-                        guard evicted + failed < batchLimit else { return }
-                        guard url.lastPathComponent.hasPrefix(".") == false else { return }
-                        if isProtected(url: url, protectedPaths: protectedPaths) { return }
-                        let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .isUbiquitousItemKey, .ubiquitousItemDownloadingStatusKey])
-                        guard values?.isRegularFile == true else { return }
-                        guard values?.isUbiquitousItem == true else { return }
-                        guard values?.ubiquitousItemDownloadingStatus == .current
-                            || values?.ubiquitousItemDownloadingStatus == .downloaded else { return }
-                        let sizeBefore = fileSize(url: url)
-                        do {
-                            try fm.evictUbiquitousItem(at: url)
-                            evicted += 1
-                            reclaimed += sizeBefore
-                        } catch {
-                            failed += 1
-                        }
+                BoundedURLEnumerator.forEachURL(in: enumerator, shouldStop: { evicted + failed >= batchLimit }) { url in
+                    guard url.lastPathComponent.hasPrefix(".") == false else { return }
+                    if isProtected(url: url, protectedPaths: protectedPaths) { return }
+                    let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .isUbiquitousItemKey, .ubiquitousItemDownloadingStatusKey])
+                    guard values?.isRegularFile == true else { return }
+                    guard values?.isUbiquitousItem == true else { return }
+                    guard values?.ubiquitousItemDownloadingStatus == .current
+                        || values?.ubiquitousItemDownloadingStatus == .downloaded else { return }
+                    let sizeBefore = fileSize(url: url)
+                    do {
+                        try fm.evictUbiquitousItem(at: url)
+                        evicted += 1
+                        reclaimed += sizeBefore
+                    } catch {
+                        failed += 1
                     }
                 }
             }
@@ -209,22 +193,19 @@ actor GuardService {
                 includingPropertiesForKeys: [.isRegularFileKey, .isUbiquitousItemKey],
                 options: [.skipsHiddenFiles]
             ) {
-                for case let url as URL in enumerator {
-                    autoreleasepool {
-                        guard evicted + failed < panicLimit else { return }
-                        guard url.lastPathComponent.hasPrefix(".") == false else { return }
-                        if isProtected(url: url, protectedPaths: protectedPaths) { return }
-                        let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .isUbiquitousItemKey])
-                        guard values?.isRegularFile == true else { return }
-                        guard values?.isUbiquitousItem == true else { return }
-                        let sizeBefore = fileSize(url: url)
-                        do {
-                            try fm.evictUbiquitousItem(at: url)
-                            evicted += 1
-                            reclaimed += sizeBefore
-                        } catch {
-                            failed += 1
-                        }
+                BoundedURLEnumerator.forEachURL(in: enumerator, shouldStop: { evicted + failed >= panicLimit }) { url in
+                    guard url.lastPathComponent.hasPrefix(".") == false else { return }
+                    if isProtected(url: url, protectedPaths: protectedPaths) { return }
+                    let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .isUbiquitousItemKey])
+                    guard values?.isRegularFile == true else { return }
+                    guard values?.isUbiquitousItem == true else { return }
+                    let sizeBefore = fileSize(url: url)
+                    do {
+                        try fm.evictUbiquitousItem(at: url)
+                        evicted += 1
+                        reclaimed += sizeBefore
+                    } catch {
+                        failed += 1
                     }
                 }
             }
@@ -253,19 +234,16 @@ actor GuardService {
                 includingPropertiesForKeys: [.isRegularFileKey, .isUbiquitousItemKey, .ubiquitousItemDownloadingStatusKey],
                 options: [.skipsHiddenFiles]
             ) {
-                for case let url as URL in enumerator {
-                    autoreleasepool {
-                        guard count < batchLimit else { return }
-                        guard url.lastPathComponent.hasPrefix(".") == false else { return }
-                        if isProtected(url: url, protectedPaths: protectedPaths) { return }
-                        let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .isUbiquitousItemKey, .ubiquitousItemDownloadingStatusKey])
-                        guard values?.isRegularFile == true else { return }
-                        guard values?.isUbiquitousItem == true else { return }
-                        guard values?.ubiquitousItemDownloadingStatus == .current
-                            || values?.ubiquitousItemDownloadingStatus == .downloaded else { return }
-                        count += 1
-                        totalBytes += fileSize(url: url)
-                    }
+                BoundedURLEnumerator.forEachURL(in: enumerator, shouldStop: { count >= batchLimit }) { url in
+                    guard url.lastPathComponent.hasPrefix(".") == false else { return }
+                    if isProtected(url: url, protectedPaths: protectedPaths) { return }
+                    let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .isUbiquitousItemKey, .ubiquitousItemDownloadingStatusKey])
+                    guard values?.isRegularFile == true else { return }
+                    guard values?.isUbiquitousItem == true else { return }
+                    guard values?.ubiquitousItemDownloadingStatus == .current
+                        || values?.ubiquitousItemDownloadingStatus == .downloaded else { return }
+                    count += 1
+                    totalBytes += fileSize(url: url)
                 }
             }
 
@@ -296,23 +274,20 @@ actor GuardService {
                 includingPropertiesForKeys: [.isRegularFileKey, .isUbiquitousItemKey, .ubiquitousItemDownloadingStatusKey],
                 options: [.skipsHiddenFiles]
             ) {
-                for case let url as URL in enumerator {
-                    autoreleasepool {
-                        guard evicted + failed < batchLimit else { return }
-                        guard url.lastPathComponent.hasPrefix(".") == false else { return }
-                        if isProtected(url: url, protectedPaths: protectedPaths) { return }
-                        let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .isUbiquitousItemKey, .ubiquitousItemDownloadingStatusKey])
-                        guard values?.isRegularFile == true else { return }
-                        guard values?.isUbiquitousItem == true else { return }
-                        guard values?.ubiquitousItemDownloadingStatus == .current
-                            || values?.ubiquitousItemDownloadingStatus == .downloaded else { return }
-                        let sizeBefore = fileSize(url: url)
-                        do {
-                            try fm.evictUbiquitousItem(at: url)
-                            evicted += 1
-                            reclaimed += sizeBefore
-                        } catch { failed += 1 }
-                    }
+                BoundedURLEnumerator.forEachURL(in: enumerator, shouldStop: { evicted + failed >= batchLimit }) { url in
+                    guard url.lastPathComponent.hasPrefix(".") == false else { return }
+                    if isProtected(url: url, protectedPaths: protectedPaths) { return }
+                    let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .isUbiquitousItemKey, .ubiquitousItemDownloadingStatusKey])
+                    guard values?.isRegularFile == true else { return }
+                    guard values?.isUbiquitousItem == true else { return }
+                    guard values?.ubiquitousItemDownloadingStatus == .current
+                        || values?.ubiquitousItemDownloadingStatus == .downloaded else { return }
+                    let sizeBefore = fileSize(url: url)
+                    do {
+                        try fm.evictUbiquitousItem(at: url)
+                        evicted += 1
+                        reclaimed += sizeBefore
+                    } catch { failed += 1 }
                 }
             }
 
@@ -335,6 +310,34 @@ actor GuardService {
         }
         // Single event with the batch — avoids N MainActor dispatches
         eventHandler(.rematerializationBatchDetected(events))
+    }
+
+    private func startRematerializationWatcherIfEnabled(using config: AppConfig) {
+        guard config.watcher.metadataWatcherEnabled else {
+            watcher?.stop()
+            watcher = nil
+            eventHandler(.watcherStopped)
+            logger.log("watcher disabled reason=config")
+            return
+        }
+
+        guard watcher == nil else { return }
+        let w = RematerializationWatcher(
+            logger: logger,
+            evictorFactory: { logger in PackageAwareEvictor(logger: logger) },
+            maxBackoffSeconds: TimeInterval(config.watcher.backoffMaxSeconds)
+        )
+        w.onRematerializationBatch = { [weak self] events in
+            Task { [weak self] in await self?.handleRematerializationBatch(events) }
+        }
+        w.start()
+        watcher = w
+        eventHandler(.watcherStarted)
+    }
+
+    private func stopRematerializationWatcher() {
+        watcher?.stop()
+        watcher = nil
     }
 
     // MARK: - Network monitor
@@ -399,27 +402,23 @@ actor GuardService {
 
         let scopePrefix = scopeURL.path + "/"
 
-        for case let url as URL in enumerator {
-            autoreleasepool {
-                guard url.lastPathComponent.hasPrefix(".") == false else { return }
-                var st = stat()
-                guard lstat(url.path, &st) == 0 else { return }
+        BoundedURLEnumerator.forEachURL(in: enumerator, shouldStop: { materialized + dataless >= 10000 }) { url in
+            guard url.lastPathComponent.hasPrefix(".") == false else { return }
+            var st = stat()
+            guard lstat(url.path, &st) == 0 else { return }
 
-                let isDataless = (st.st_flags & SF_DATALESS) != 0
-                if isDataless {
-                    dataless += 1
-                } else if st.st_size > 0 {
-                    materialized += 1
-                }
+            let isDataless = (st.st_flags & SF_DATALESS) != 0
+            if isDataless {
+                dataless += 1
+            } else if st.st_size > 0 {
+                materialized += 1
+            }
 
-                // Track top-level folder sizes — compute once per iteration
-                if !isDataless {
-                    let relPath = url.path.replacingOccurrences(of: scopePrefix, with: "")
-                    let topFolder = relPath.split(separator: "/").first.map(String.init) ?? "(root)"
-                    folderSizes[topFolder, default: 0] += Int64(st.st_blocks) * 512
-                }
-
-                if materialized + dataless >= 10000 { return }
+            // Track top-level folder sizes — compute once per iteration
+            if !isDataless {
+                let relPath = url.path.replacingOccurrences(of: scopePrefix, with: "")
+                let topFolder = relPath.split(separator: "/").first.map(String.init) ?? "(root)"
+                folderSizes[topFolder, default: 0] += Int64(st.st_blocks) * 512
             }
         }
 
