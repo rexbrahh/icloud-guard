@@ -80,6 +80,26 @@ public struct PolicyConfig: Codable, Equatable, Sendable {
     public var remediateFreeBytes: Int64 { Int64(remediateFreeGiB) * bytesPerGiB }
     public var panicFreeBytes: Int64 { Int64(panicFreeGiB) * bytesPerGiB }
     public var growthTriggerBytes: Int64 { Int64(growthTriggerGiB) * bytesPerGiB }
+
+    public func normalized() -> PolicyConfig {
+        let target = max(targetLocalGiB, 0)
+        let trim = target == 0 && trimLocalGiB == 0 ? 0 : max(trimLocalGiB, target + 1)
+        let panic = max(panicFreeGiB, 0)
+        let remediate = max(remediateFreeGiB, panic)
+        let warn = max(warnFreeGiB, remediate)
+        return PolicyConfig(
+            sampleIntervalSeconds: max(sampleIntervalSeconds, 1),
+            targetLocalGiB: target,
+            trimLocalGiB: trim,
+            warnFreeGiB: warn,
+            remediateFreeGiB: remediate,
+            panicFreeGiB: panic,
+            growthTriggerGiB: max(growthTriggerGiB, 0),
+            growthWindowMinutes: max(growthWindowMinutes, 1),
+            cooldownMinutes: max(cooldownMinutes, 0),
+            protectedPaths: protectedPaths
+        )
+    }
 }
 
 public struct GuardSample: Codable, Equatable, Sendable {

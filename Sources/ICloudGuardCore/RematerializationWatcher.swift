@@ -16,7 +16,7 @@ public final class RematerializationWatcher {
     private let evictorFactory: (GuardLogging) -> ICloudEvicting
     private var query: NSMetadataQuery?
     private var backoffSeconds: TimeInterval = 1.0
-    private let maxBackoffSeconds: TimeInterval = 60.0
+    private let maxBackoffSeconds: TimeInterval
     private var lastRematerializationAt: Date?
     private var rematerializationCount: Int = 0
     private let protectedPaths: [String]
@@ -30,9 +30,14 @@ public final class RematerializationWatcher {
     /// Batch callback: receives all coalesced events in one invocation.
     public var onRematerializationBatch: (([RematerializationEvent]) -> Void)?
 
-    public init(logger: GuardLogging, evictorFactory: @escaping (GuardLogging) -> ICloudEvicting) {
+    public init(
+        logger: GuardLogging,
+        evictorFactory: @escaping (GuardLogging) -> ICloudEvicting,
+        maxBackoffSeconds: TimeInterval = 60.0
+    ) {
         self.logger = logger
         self.evictorFactory = evictorFactory
+        self.maxBackoffSeconds = max(maxBackoffSeconds, 1.0)
         self.protectedPaths = ConfigStore().load().scope.protectedPaths
     }
 

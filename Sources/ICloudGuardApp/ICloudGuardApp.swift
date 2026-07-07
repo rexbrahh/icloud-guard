@@ -35,7 +35,16 @@ public struct ICloudGuardApp: App {
 
     public var body: some Scene {
         // Hidden window must precede Settings for it to work from MenuBarExtra
-        Window("_", id: "_hidden") { EmptyView() }
+        Window("_", id: "_hidden") {
+            EmptyView()
+                .onAppear {
+                    appConfigModel.onChange = { [viewModel] in
+                        Task { @MainActor in
+                            viewModel.reloadConfig()
+                        }
+                    }
+                }
+        }
             .windowResizability(.contentSize)
             .defaultSize(width: 1, height: 1)
 

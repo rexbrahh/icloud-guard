@@ -8,15 +8,16 @@ public enum PolicyEngine {
         now: Date,
         forcePanic: Bool = false
     ) -> GuardDecision {
-        let eligible = prioritizedCandidates(from: scan, protectedPaths: config.policy.protectedPaths)
-        let growthBytes = calculateGrowthBytes(samples: state.samples, now: now, config: config.policy)
-        let targetedReason = remediationReason(scan: scan, growthBytes: growthBytes, config: config.policy)
+        let policy = config.policy.normalized()
+        let eligible = prioritizedCandidates(from: scan, protectedPaths: policy.protectedPaths)
+        let growthBytes = calculateGrowthBytes(samples: state.samples, now: now, config: policy)
+        let targetedReason = remediationReason(scan: scan, growthBytes: growthBytes, config: policy)
 
         if forcePanic {
             return panicDecision(reason: "manual panic eviction", scan: scan, eligible: eligible, growthBytes: growthBytes)
         }
 
-        if scan.freeBytes < config.policy.panicFreeBytes {
+        if scan.freeBytes < policy.panicFreeBytes {
             return panicDecision(reason: "free space below panic floor", scan: scan, eligible: eligible, growthBytes: growthBytes)
         }
 
@@ -33,7 +34,7 @@ public enum PolicyEngine {
             )
         }
 
-        if let cooldownRemainingSeconds = cooldownRemainingSeconds(state: state, now: now, config: config.policy) {
+        if let cooldownRemainingSeconds = cooldownRemainingSeconds(state: state, now: now, config: policy) {
             return GuardDecision(
                 kind: .cooldown,
                 reason: reason,
@@ -46,7 +47,7 @@ public enum PolicyEngine {
             )
         }
 
-        let targetedCandidates = selectTargetedCandidates(scan: scan, config: config.policy, eligible: eligible)
+        let targetedCandidates = selectTargetedCandidates(scan: scan, config: policy, eligible: eligible)
         let reclaimedBytes = targetedCandidates.reduce(into: Int64(0)) { partialResult, item in
             partialResult += item.localBytes
         }
@@ -55,7 +56,7 @@ public enum PolicyEngine {
             kind: .targeted,
             reason: reason,
             candidates: targetedCandidates,
-            reclaimTargetBytes: targetedReclaimTargetBytes(scan: scan, config: config.policy),
+            reclaimTargetBytes: targetedReclaimTargetBytes(scan: scan, config: policy),
             predictedLocalBytes: max(scan.localBytes - reclaimedBytes, 0),
             predictedFreeBytes: scan.freeBytes + reclaimedBytes,
             cooldownRemainingSeconds: nil,
@@ -85,8 +86,9 @@ public enum PolicyEngine {
         config: PolicyConfig,
         eligible: [ICloudItemSnapshot]? = nil
     ) -> [ICloudItemSnapshot] {
-        let candidates = eligible ?? prioritizedCandidates(from: scan, protectedPaths: config.protectedPaths)
-        let reclaimTarget = targetedReclaimTargetBytes(scan: scan, config: config)
+        let normalizedConfig = config.normalized()
+        let candidates = eligible ?? prioritizedCandidates(from: scan, protectedPaths: normalizedConfig.protectedPaths)
+        let reclaimTarget = targetedReclaimTargetBytes(scan: scan, config: normalizedConfig)
 
         if reclaimTarget <= 0 {
             return []
@@ -108,11 +110,12 @@ public enum PolicyEngine {
     }
 
     public static func panicCandidates(scan: ScanResult, config: PolicyConfig) -> [ICloudItemSnapshot] {
-        prioritizedCandidates(from: scan, protectedPaths: config.protectedPaths)
+        prioritizedCandidates(from: scan, protectedPaths: config.normalized().protectedPaths)
     }
 
     public static func calculateGrowthBytes(samples: [GuardSample], now: Date, config: PolicyConfig) -> Int64 {
-        let threshold = now.addingTimeInterval(TimeInterval(-config.growthWindowMinutes * 60))
+        let normalizedConfig = config.normalized()
+        let threshold = now.addingTimeInterval(TimeInterval(-normalizedConfig.growthWindowMinutes * 60))
         guard let earliest = samples
             .filter({ $0.timestamp >= threshold })
             .sorted(by: { $0.timestamp < $1.timestamp })
@@ -133,26 +136,29 @@ public enum PolicyEngine {
             return nil
         }
 
-        let remaining = Int(lastRemediationAt.addingTimeInterval(TimeInterval(config.cooldownMinutes * 60)).timeIntervalSince(now))
+        let normalizedConfig = config.normalized()
+        let remaining = Int(lastRemediationAt.addingTimeInterval(TimeInterval(normalizedConfig.cooldownMinutes * 60)).timeIntervalSince(now))
         return remaining > 0 ? remaining : nil
     }
 
     public static func targetedReclaimTargetBytes(scan: ScanResult, config: PolicyConfig) -> Int64 {
-        let localOverflow = max(scan.localBytes - config.targetLocalBytes, 0)
-        let freeSpaceShortfall = max(config.warnFreeBytes - scan.freeBytes, 0)
+        let normalizedConfig = config.normalized()
+        let localOverflow = max(scan.localBytes - normalizedConfig.targetLocalBytes, 0)
+        let freeSpaceShortfall = max(normalizedConfig.warnFreeBytes - scan.freeBytes, 0)
         return max(localOverflow, freeSpaceShortfall)
     }
 
     private static func remediationReason(scan: ScanResult, growthBytes: Int64, config: PolicyConfig) -> String? {
-        if scan.localBytes > config.trimLocalBytes {
+        let normalizedConfig = config.normalized()
+        if scan.localBytes > normalizedConfig.trimLocalBytes {
             return "local iCloud usage exceeded trim threshold"
         }
 
-        if scan.freeBytes < config.remediateFreeBytes {
+        if scan.freeBytes < normalizedConfig.remediateFreeBytes {
             return "free space below remediation floor"
         }
 
-        if growthBytes > config.growthTriggerBytes {
+        if growthBytes > normalizedConfig.growthTriggerBytes {
             return "local iCloud usage grew too quickly"
         }
 

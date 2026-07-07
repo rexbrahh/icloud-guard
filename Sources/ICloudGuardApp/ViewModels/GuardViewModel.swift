@@ -127,6 +127,10 @@ final class GuardViewModel: ObservableObject {
         Task { await guardService?.stop(); guardService = nil }
     }
 
+    func reloadConfig() {
+        Task { await guardService?.reloadConfig() }
+    }
+
     private func handleServiceEvent(_ event: GuardServiceEvent) {
         switch event {
         case .suppressionApplied:

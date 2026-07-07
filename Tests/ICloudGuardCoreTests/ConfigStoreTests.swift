@@ -23,6 +23,7 @@ final class ConfigStoreTests: XCTestCase {
         XCTAssertFalse(config.suppression.materializeDataless)
         XCTAssertEqual(config.eviction.batchLimit, 500)
         XCTAssertEqual(config.eviction.panicLimit, 2000)
+        XCTAssertFalse(config.watcher.metadataWatcherEnabled)
         XCTAssertEqual(config.watcher.backoffMaxSeconds, 60)
         XCTAssertEqual(config.watcher.pollutionCheckIntervalSeconds, 300)
         XCTAssertTrue(config.scope.path.contains("CloudDocs"))
@@ -33,7 +34,7 @@ final class ConfigStoreTests: XCTestCase {
         let original = AppConfig(
             suppression: .init(spotlight: false, quicklook: false, materializeDataless: true),
             eviction: .init(batchLimit: 100, panicLimit: 500),
-            watcher: .init(backoffMaxSeconds: 30, pollutionCheckIntervalSeconds: 120),
+            watcher: .init(metadataWatcherEnabled: true, backoffMaxSeconds: 30, pollutionCheckIntervalSeconds: 120),
             scope: .init(path: "/custom/path", protectedPaths: ["/keep/this", "/also/this"]),
             policy: .init(targetLocalGiB: 20, trimLocalGiB: 25, warnFreeGiB: 70, remediateFreeGiB: 40, panicFreeGiB: 20, cooldownMinutes: 15, growthTriggerGiB: 10, growthWindowMinutes: 5)
         )
@@ -47,6 +48,7 @@ final class ConfigStoreTests: XCTestCase {
         XCTAssertEqual(loaded.suppression.materializeDataless, true)
         XCTAssertEqual(loaded.eviction.batchLimit, 100)
         XCTAssertEqual(loaded.eviction.panicLimit, 500)
+        XCTAssertEqual(loaded.watcher.metadataWatcherEnabled, true)
         XCTAssertEqual(loaded.watcher.backoffMaxSeconds, 30)
         XCTAssertEqual(loaded.watcher.pollutionCheckIntervalSeconds, 120)
         XCTAssertEqual(loaded.scope.path, "/custom/path")
@@ -92,6 +94,7 @@ final class ConfigStoreTests: XCTestCase {
         XCTAssertTrue(content.contains("[policy]"))
         XCTAssertTrue(content.contains("spotlight = true"))
         XCTAssertTrue(content.contains("batch_limit = 500"))
+        XCTAssertTrue(content.contains("metadata_watcher_enabled = false"))
         XCTAssertTrue(content.contains("protected_paths = []"))
     }
 
@@ -106,6 +109,7 @@ final class ConfigStoreTests: XCTestCase {
         let config = store.load()
         XCTAssertEqual(config.suppression.spotlight, false)
         XCTAssertEqual(config.eviction.batchLimit, 500)
+        XCTAssertFalse(config.watcher.metadataWatcherEnabled)
         XCTAssertEqual(config.watcher.backoffMaxSeconds, 60)
         XCTAssertEqual(config.policy.targetLocalGiB, 30)
     }
@@ -174,7 +178,7 @@ final class ConfigStoreTests: XCTestCase {
         var config = firstStore.load()
         config.suppression = .init(spotlight: false, quicklook: false, materializeDataless: true)
         config.eviction = .init(batchLimit: 100, panicLimit: 500)
-        config.watcher = .init(backoffMaxSeconds: 30, pollutionCheckIntervalSeconds: 120)
+        config.watcher = .init(metadataWatcherEnabled: true, backoffMaxSeconds: 30, pollutionCheckIntervalSeconds: 120)
         config.scope = .init(path: "/custom/path", protectedPaths: ["/keep/this", "/also/this"])
         try firstStore.save(config)
 
@@ -183,7 +187,7 @@ final class ConfigStoreTests: XCTestCase {
 
         XCTAssertEqual(reloaded.suppression, AppConfig.SuppressionConfig(spotlight: false, quicklook: false, materializeDataless: true))
         XCTAssertEqual(reloaded.eviction, AppConfig.EvictionConfig(batchLimit: 100, panicLimit: 500))
-        XCTAssertEqual(reloaded.watcher, AppConfig.WatcherConfig(backoffMaxSeconds: 30, pollutionCheckIntervalSeconds: 120))
+        XCTAssertEqual(reloaded.watcher, AppConfig.WatcherConfig(metadataWatcherEnabled: true, backoffMaxSeconds: 30, pollutionCheckIntervalSeconds: 120))
         XCTAssertEqual(reloaded.scope, AppConfig.ScopeConfig(path: "/custom/path", protectedPaths: ["/keep/this", "/also/this"]))
     }
 
@@ -257,6 +261,26 @@ final class ConfigStoreTests: XCTestCase {
         XCTAssertEqual(reloaded.policy.panicFreeGiB, 25)
         XCTAssertEqual(reloaded.policy.growthTriggerGiB, 20)
         XCTAssertEqual(reloaded.policy.growthWindowMinutes, 10)
+    }
+
+    func testInvalidPolicyThresholdsAreNormalized() throws {
+        let url = tempDir.appendingPathComponent("settings_invalid_policy.toml")
+        let store = ConfigStore(configURL: url)
+        var config = store.load()
+
+        config.policy.targetLocalGiB = 15
+        config.policy.trimLocalGiB = 13
+        config.policy.warnFreeGiB = 20
+        config.policy.remediateFreeGiB = 30
+        config.policy.panicFreeGiB = 40
+        try store.save(config)
+
+        let reloaded = ConfigStore(configURL: url).load()
+        XCTAssertEqual(reloaded.policy.targetLocalGiB, 15)
+        XCTAssertEqual(reloaded.policy.trimLocalGiB, 16)
+        XCTAssertEqual(reloaded.policy.panicFreeGiB, 40)
+        XCTAssertEqual(reloaded.policy.remediateFreeGiB, 40)
+        XCTAssertEqual(reloaded.policy.warnFreeGiB, 40)
     }
 
 }

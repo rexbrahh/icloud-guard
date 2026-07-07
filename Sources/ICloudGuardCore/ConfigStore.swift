@@ -17,6 +17,7 @@ import Foundation
 /// panic_limit = 2000
 ///
 /// [watcher]
+/// metadata_watcher_enabled = false
 /// backoff_max_seconds = 60
 /// pollution_check_interval_seconds = 300
 ///
@@ -41,7 +42,17 @@ public struct AppConfig: Equatable, Sendable {
         self.eviction = eviction
         self.watcher = watcher
         self.scope = scope
-        self.policy = policy
+        self.policy = policy.normalized()
+    }
+
+    public func normalized() -> AppConfig {
+        AppConfig(
+            suppression: suppression,
+            eviction: eviction,
+            watcher: watcher,
+            scope: scope,
+            policy: policy.normalized()
+        )
     }
 
     public struct SuppressionConfig: Equatable, Sendable, Codable {
@@ -53,6 +64,11 @@ public struct AppConfig: Equatable, Sendable {
             self.spotlight = spotlight
             self.quicklook = quicklook
             self.materializeDataless = materializeDataless
+        }
+
+        public var nonMaterializingIOPolicyEnabled: Bool {
+            get { !materializeDataless }
+            set { materializeDataless = !newValue }
         }
     }
 
@@ -67,10 +83,16 @@ public struct AppConfig: Equatable, Sendable {
     }
 
     public struct WatcherConfig: Equatable, Sendable, Codable {
+        public var metadataWatcherEnabled: Bool
         public var backoffMaxSeconds: Int
         public var pollutionCheckIntervalSeconds: Int
 
-        public init(backoffMaxSeconds: Int = 60, pollutionCheckIntervalSeconds: Int = 300) {
+        public init(
+            metadataWatcherEnabled: Bool = false,
+            backoffMaxSeconds: Int = 60,
+            pollutionCheckIntervalSeconds: Int = 300
+        ) {
+            self.metadataWatcherEnabled = metadataWatcherEnabled
             self.backoffMaxSeconds = backoffMaxSeconds
             self.pollutionCheckIntervalSeconds = pollutionCheckIntervalSeconds
         }
@@ -115,6 +137,24 @@ public struct AppConfig: Equatable, Sendable {
             self.growthTriggerGiB = growthTriggerGiB
             self.growthWindowMinutes = growthWindowMinutes
         }
+
+        public func normalized() -> PolicyConfig {
+            let target = max(targetLocalGiB, 0)
+            let trim = target == 0 && trimLocalGiB == 0 ? 0 : max(trimLocalGiB, target + 1)
+            let panic = max(panicFreeGiB, 0)
+            let remediate = max(remediateFreeGiB, panic)
+            let warn = max(warnFreeGiB, remediate)
+            return PolicyConfig(
+                targetLocalGiB: target,
+                trimLocalGiB: trim,
+                warnFreeGiB: warn,
+                remediateFreeGiB: remediate,
+                panicFreeGiB: panic,
+                cooldownMinutes: max(cooldownMinutes, 0),
+                growthTriggerGiB: max(growthTriggerGiB, 0),
+                growthWindowMinutes: max(growthWindowMinutes, 1)
+            )
+        }
     }
 }
 
@@ -141,7 +181,7 @@ public final class ConfigStore {
     public func save(_ config: AppConfig) throws {
         let dir = configURL.deletingLastPathComponent()
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        let toml = serializeToml(config)
+        let toml = serializeToml(config.normalized())
         try toml.write(to: configURL, atomically: true, encoding: .utf8)
     }
 
@@ -186,6 +226,7 @@ public final class ConfigStore {
                 }
             case "watcher":
                 switch key {
+                case "metadata_watcher_enabled": watcher.metadataWatcherEnabled = parseBool(rawValue)
                 case "backoff_max_seconds": watcher.backoffMaxSeconds = parseInt(rawValue) ?? 60
                 case "pollution_check_interval_seconds": watcher.pollutionCheckIntervalSeconds = parseInt(rawValue) ?? 300
                 default: break
@@ -253,6 +294,7 @@ public final class ConfigStore {
         lines.append("panic_limit = \(config.eviction.panicLimit)")
         lines.append("")
         lines.append("[watcher]")
+        lines.append("metadata_watcher_enabled = \(config.watcher.metadataWatcherEnabled)")
         lines.append("backoff_max_seconds = \(config.watcher.backoffMaxSeconds)")
         lines.append("pollution_check_interval_seconds = \(config.watcher.pollutionCheckIntervalSeconds)")
         lines.append("")

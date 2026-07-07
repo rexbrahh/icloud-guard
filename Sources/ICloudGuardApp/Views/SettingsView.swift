@@ -57,7 +57,9 @@ private struct GeneralSettingsView: View {
                         .toggleStyle(.switch)
                     Toggle("QuickLook cache clearing", isOn: Binding(get: { configModel.config.suppression.quicklook }, set: { configModel.updateSuppression(.init(spotlight: configModel.config.suppression.spotlight, quicklook: $0, materializeDataless: configModel.config.suppression.materializeDataless)) }))
                         .toggleStyle(.switch)
-                    Toggle("Non-materializing I/O policy", isOn: Binding(get: { configModel.config.suppression.materializeDataless }, set: { configModel.updateSuppression(.init(spotlight: configModel.config.suppression.spotlight, quicklook: configModel.config.suppression.quicklook, materializeDataless: $0)) }))
+                    Toggle("Non-materializing I/O policy", isOn: Binding(get: { configModel.config.suppression.nonMaterializingIOPolicyEnabled }, set: { configModel.updateSuppression(.init(spotlight: configModel.config.suppression.spotlight, quicklook: configModel.config.suppression.quicklook, materializeDataless: !$0)) }))
+                        .toggleStyle(.switch)
+                    Toggle("Metadata rematerialization watcher", isOn: Binding(get: { configModel.config.watcher.metadataWatcherEnabled }, set: { configModel.updateWatcher(.init(metadataWatcherEnabled: $0, backoffMaxSeconds: configModel.config.watcher.backoffMaxSeconds, pollutionCheckIntervalSeconds: configModel.config.watcher.pollutionCheckIntervalSeconds)) }))
                         .toggleStyle(.switch)
                 }
 
@@ -143,8 +145,8 @@ private struct PolicySettingsView: View {
                     Text("Timing")
                         .font(.headline)
                     Stepper("Cooldown: \(configModel.config.policy.cooldownMinutes)min", value: Binding(get: { configModel.config.policy.cooldownMinutes }, set: { configModel.updatePolicy(.init(targetLocalGiB: configModel.config.policy.targetLocalGiB, trimLocalGiB: configModel.config.policy.trimLocalGiB, warnFreeGiB: configModel.config.policy.warnFreeGiB, remediateFreeGiB: configModel.config.policy.remediateFreeGiB, panicFreeGiB: configModel.config.policy.panicFreeGiB, cooldownMinutes: $0, growthTriggerGiB: configModel.config.policy.growthTriggerGiB, growthWindowMinutes: configModel.config.policy.growthWindowMinutes)) }), in: 1...120)
-                    Stepper("Pollution check: \(configModel.config.watcher.pollutionCheckIntervalSeconds)s", value: Binding(get: { configModel.config.watcher.pollutionCheckIntervalSeconds }, set: { configModel.updateWatcher(.init(backoffMaxSeconds: configModel.config.watcher.backoffMaxSeconds, pollutionCheckIntervalSeconds: $0)) }), in: 60...3600, step: 60)
-                    Stepper("Watcher backoff max: \(configModel.config.watcher.backoffMaxSeconds)s", value: Binding(get: { configModel.config.watcher.backoffMaxSeconds }, set: { configModel.updateWatcher(.init(backoffMaxSeconds: $0, pollutionCheckIntervalSeconds: configModel.config.watcher.pollutionCheckIntervalSeconds)) }), in: 10...300, step: 10)
+                    Stepper("Pollution check: \(configModel.config.watcher.pollutionCheckIntervalSeconds)s", value: Binding(get: { configModel.config.watcher.pollutionCheckIntervalSeconds }, set: { configModel.updateWatcher(.init(metadataWatcherEnabled: configModel.config.watcher.metadataWatcherEnabled, backoffMaxSeconds: configModel.config.watcher.backoffMaxSeconds, pollutionCheckIntervalSeconds: $0)) }), in: 60...3600, step: 60)
+                    Stepper("Watcher backoff max: \(configModel.config.watcher.backoffMaxSeconds)s", value: Binding(get: { configModel.config.watcher.backoffMaxSeconds }, set: { configModel.updateWatcher(.init(metadataWatcherEnabled: configModel.config.watcher.metadataWatcherEnabled, backoffMaxSeconds: $0, pollutionCheckIntervalSeconds: configModel.config.watcher.pollutionCheckIntervalSeconds)) }), in: 10...300, step: 10)
                 }
 
                 Divider()

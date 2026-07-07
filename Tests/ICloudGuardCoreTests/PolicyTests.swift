@@ -164,6 +164,20 @@ final class PolicyTests: XCTestCase {
         XCTAssertTrue(decision.reason.contains("grew too quickly"))
     }
 
+    func testInvalidTrimBelowTargetIsNormalizedBeforeEvaluation() {
+        var badConfig = config
+        badConfig.policy.targetLocalGiB = 15
+        badConfig.policy.trimLocalGiB = 13
+        let items = [snapshot(relativePath: "Ready.mov", localGiB: 4)]
+        let scan = ScanResult(scopePath: "/tmp", freeBytes: 120 * bytesPerGiB, localBytes: 17 * bytesPerGiB, items: items)
+
+        let decision = PolicyEngine.evaluate(scan: scan, state: GuardState(), config: badConfig, now: Date())
+
+        XCTAssertEqual(decision.kind, .targeted)
+        XCTAssertEqual(decision.reclaimTargetBytes, 2 * bytesPerGiB)
+        XCTAssertEqual(decision.candidates.map(\.relativePath), ["Ready.mov"])
+    }
+
     private func snapshot(
         relativePath: String,
         localGiB: Int,
