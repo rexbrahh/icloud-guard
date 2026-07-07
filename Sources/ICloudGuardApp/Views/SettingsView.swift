@@ -218,7 +218,7 @@ private struct AboutView: View {
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
                 .frame(maxWidth: 320)
-            Text("Version 0.4.3")
+            Text("Version 0.4.4")
                 .font(.caption2)
                 .foregroundStyle(.tertiary)
         }
