@@ -47,13 +47,15 @@ struct Status: ParsableCommand {
         let client = IPCClient()
         do {
             let result = try client.send(command: .status, dryRun: dryRun)
-            print(result.output)
-            Foundation.exit(Int32(truncatingIfNeeded: result.exitCode))
+            if result.exitCode == 0 {
+                print(result.output)
+                Foundation.exit(0)
+            }
         } catch {
-            let runner = GuardRunner()
-            let exitCode = try runner.run(command: .status, configPath: nil, dryRun: dryRun)
-            Foundation.exit(exitCode)
         }
+        let runner = GuardRunner()
+        let exitCode = try runner.run(command: .status, configPath: nil, dryRun: dryRun)
+        Foundation.exit(exitCode)
     }
 }
 
@@ -70,13 +72,15 @@ struct Evict: ParsableCommand {
         let client = IPCClient()
         do {
             let result = try client.send(command: .evict, dryRun: dryRun)
-            print(result.output)
-            Foundation.exit(Int32(truncatingIfNeeded: result.exitCode))
+            if result.exitCode == 0 {
+                print(result.output)
+                Foundation.exit(0)
+            }
         } catch {
-            let runner = GuardRunner()
-            let exitCode = try runner.run(command: .run, configPath: nil, dryRun: dryRun)
-            Foundation.exit(exitCode)
         }
+        let runner = GuardRunner()
+        let exitCode = try runner.run(command: .run, configPath: nil, dryRun: dryRun)
+        Foundation.exit(exitCode)
     }
 }
 
@@ -93,13 +97,15 @@ struct PanicEvict: ParsableCommand {
         let client = IPCClient()
         do {
             let result = try client.send(command: .panicEvict, dryRun: dryRun)
-            print(result.output)
-            Foundation.exit(Int32(truncatingIfNeeded: result.exitCode))
+            if result.exitCode == 0 {
+                print(result.output)
+                Foundation.exit(0)
+            }
         } catch {
-            let runner = GuardRunner()
-            let exitCode = try runner.run(command: .panicEvict, configPath: nil, dryRun: dryRun)
-            Foundation.exit(exitCode)
         }
+        let runner = GuardRunner()
+        let exitCode = try runner.run(command: .panicEvict, configPath: nil, dryRun: dryRun)
+        Foundation.exit(exitCode)
     }
 }
 

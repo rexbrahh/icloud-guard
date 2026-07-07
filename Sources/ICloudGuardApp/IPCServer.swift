@@ -149,20 +149,17 @@ final class IPCServer {
             return
         }
 
-        let dryRun = (cmdJson["dry_run"] as? Bool) ?? false
-
         // Execute command and send streaming response.
-        // T18 will wire these to GuardService.
+        // The GUI service is actor-driven and does not yet stream command output over IPC.
+        // Return an explicit error so CLI callers fall back to the real local GuardRunner
+        // instead of reporting a success-shaped no-op.
         switch cmd {
         case "status":
-            sendProgress(fd: fd, message: "Checking status...")
-            sendDone(fd: fd, exitCode: 0, output: "Status: OK")
+            sendError(fd: fd, message: "GUI IPC status execution is unavailable; falling back to local runner")
         case "evict":
-            sendProgress(fd: fd, message: "Starting eviction (dry_run: \(dryRun))...")
-            sendDone(fd: fd, exitCode: 0, output: "Eviction complete")
+            sendError(fd: fd, message: "GUI IPC eviction execution is unavailable; falling back to local runner")
         case "panic-evict":
-            sendProgress(fd: fd, message: "Starting panic eviction...")
-            sendDone(fd: fd, exitCode: 0, output: "Panic eviction complete")
+            sendError(fd: fd, message: "GUI IPC panic eviction execution is unavailable; falling back to local runner")
         default:
             sendError(fd: fd, message: "Unknown command: \(cmd)")
         }

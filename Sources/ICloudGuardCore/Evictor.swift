@@ -3,13 +3,13 @@ import Foundation
 
 /// Layer 2: Correct eviction with leaf-first package handling and SF_DATALESS verification.
 ///
-/// The existing `Evictor` in GuardRunner.swift calls `evictUbiquitousItem` on the
-/// package root URL. If any child has an open file descriptor, this fails atomically
-/// with EBUSY. This improved evictor evicts leaf files first, then the package root,
-/// and verifies the APFS SF_DATALESS flag (0x40000000) post-eviction.
+/// Package roots can fail atomically when any child has an open file descriptor.
+/// This evictor trims regular package leaves first, then the package root, and
+/// verifies the APFS SF_DATALESS flag (0x40000000) post-eviction.
 public final class PackageAwareEvictor: ICloudEvicting {
     private let fileManager = FileManager.default
     private let logger: GuardLogging
+    private let failureLogSampleLimit = 20
 
     public init(logger: GuardLogging) {
         self.logger = logger
@@ -25,24 +25,30 @@ public final class PackageAwareEvictor: ICloudEvicting {
 
         var evictedCount = 0
         var failedCount = 0
+        var failureSamplesRemaining = failureLogSampleLimit
 
         for item in items {
             let url = URL(fileURLWithPath: item.absolutePath)
 
             if item.isPackage {
                 // Leaf-first eviction for packages: evict children before root
-                let packageResult = evictPackageLeafFirst(url: url, item: item)
+                let packageResult = evictPackageLeafFirst(
+                    url: url,
+                    item: item,
+                    failureSamplesRemaining: &failureSamplesRemaining
+                )
                 evictedCount += packageResult.evictedCount
                 failedCount += packageResult.failedCount
             } else {
-                do {
-                    try fileManager.evictUbiquitousItem(at: url)
-                    evictedCount += 1
-                    logger.log("evicted \(item.relativePath) bytes=\(item.localBytes)")
-                } catch {
-                    failedCount += 1
-                    logger.log("failed to evict \(item.relativePath): \(error)")
-                }
+                let result = evictSingle(
+                    url: url,
+                    relativePath: item.relativePath,
+                    requestedBytes: item.localBytes,
+                    role: "file",
+                    failureSamplesRemaining: &failureSamplesRemaining
+                )
+                evictedCount += result.evictedCount
+                failedCount += result.failedCount
             }
         }
 
@@ -52,7 +58,11 @@ public final class PackageAwareEvictor: ICloudEvicting {
     /// Evict a package directory by first evicting all leaf files, then the root.
     /// This avoids the atomic EBUSY failure that occurs when evicting a package
     /// with open file descriptors on any child.
-    private func evictPackageLeafFirst(url: URL, item: ICloudItemSnapshot) -> EvictionResult {
+    private func evictPackageLeafFirst(
+        url: URL,
+        item: ICloudItemSnapshot,
+        failureSamplesRemaining: inout Int
+    ) -> EvictionResult {
         var evictedCount = 0
         var failedCount = 0
 
@@ -64,31 +74,90 @@ public final class PackageAwareEvictor: ICloudEvicting {
         ) {
             for case let childURL as URL in enumerator {
                 guard childURL.lastPathComponent.hasPrefix(".") == false else { continue }
+                let values = try? childURL.resourceValues(forKeys: [.isRegularFileKey, .isUbiquitousItemKey])
+                guard values?.isRegularFile == true, values?.isUbiquitousItem == true else { continue }
+                let childRelativePath = item.relativePath + "/" + relativePath(from: url, to: childURL)
 
-                do {
-                    try fileManager.evictUbiquitousItem(at: childURL)
-                    evictedCount += 1
-                } catch {
-                    // Individual child failures are expected (some may not be ubiquitous)
-                    failedCount += 1
-                    logger.log("package-child evict failed path=\(childURL.lastPathComponent) error=\(error)")
-                }
+                let childResult = evictSingle(
+                    url: childURL,
+                    relativePath: childRelativePath,
+                    requestedBytes: 0,
+                    role: "package-child",
+                    failureSamplesRemaining: &failureSamplesRemaining
+                )
+                evictedCount += childResult.evictedCount
+                failedCount += childResult.failedCount
             }
         }
 
         // Now evict the package root itself
-        do {
-            try fileManager.evictUbiquitousItem(at: url)
-            evictedCount += 1
-            logger.log("evicted package-root \(item.relativePath) bytes=\(item.localBytes)")
-        } catch {
-            // Root may fail if children are still locked, but that's OK —
-            // the children being dataless is what matters for disk space.
-            failedCount += 1
-            logger.log("package-root evict failed path=\(item.relativePath) error=\(error)")
-        }
+        let rootResult = evictSingle(
+            url: url,
+            relativePath: item.relativePath,
+            requestedBytes: item.localBytes,
+            role: "package-root",
+            failureSamplesRemaining: &failureSamplesRemaining
+        )
+        evictedCount += rootResult.evictedCount
+        failedCount += rootResult.failedCount
 
         return EvictionResult(evictedCount: evictedCount, failedCount: failedCount)
+    }
+
+    private func evictSingle(
+        url: URL,
+        relativePath: String,
+        requestedBytes: Int64,
+        role: String,
+        failureSamplesRemaining: inout Int
+    ) -> EvictionResult {
+        do {
+            try fileManager.evictUbiquitousItem(at: url)
+            let verification = Self.verifyDataless(at: url.path)
+            logger.log(
+                "evicted role=\(role) path=\(relativePath) requestedBytes=\(requestedBytes) " +
+                "dataless=\(verification.isDataless) allocatedAfter=\(verification.fileAllocatedSize) logicalSize=\(verification.fileSize)"
+            )
+            return EvictionResult(evictedCount: 1, failedCount: 0)
+        } catch {
+            logFailure(
+                error,
+                url: url,
+                relativePath: relativePath,
+                role: role,
+                failureSamplesRemaining: &failureSamplesRemaining
+            )
+            return EvictionResult(evictedCount: 0, failedCount: 1)
+        }
+    }
+
+    private func logFailure(
+        _ error: Error,
+        url: URL,
+        relativePath: String,
+        role: String,
+        failureSamplesRemaining: inout Int
+    ) {
+        guard failureSamplesRemaining > 0 else { return }
+        failureSamplesRemaining -= 1
+
+        let nsError = error as NSError
+        let verification = Self.verifyDataless(at: url.path)
+        logger.log(
+            "evict-failed role=\(role) path=\(relativePath) domain=\(nsError.domain) code=\(nsError.code) " +
+            "dataless=\(verification.isDataless) allocated=\(verification.fileAllocatedSize) logicalSize=\(verification.fileSize) " +
+            "error=\(nsError.localizedDescription)"
+        )
+
+        if failureSamplesRemaining == 0 {
+            logger.log("evict-failed further-failures-suppressed sampleLimit=\(failureLogSampleLimit)")
+        }
+    }
+
+    private func relativePath(from rootURL: URL, to childURL: URL) -> String {
+        let rootComponents = rootURL.standardizedFileURL.pathComponents
+        let childComponents = childURL.standardizedFileURL.pathComponents
+        return childComponents.dropFirst(rootComponents.count).joined(separator: "/")
     }
 
     /// Verify that a file is truly dataless (evicted) by checking the APFS

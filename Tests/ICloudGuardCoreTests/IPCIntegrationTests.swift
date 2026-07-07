@@ -88,6 +88,23 @@ final class IPCIntegrationTests: XCTestCase {
         XCTAssertEqual(server.capturedCommand, "evict")
         XCTAssertEqual(server.capturedDryRun, true)
     }
+
+    func testServerErrorIsReturnedToCallerForFallbackDecision() throws {
+        let server = try CapturingServer(
+            socketPath: tempSocketPath,
+            responseExitCode: 1,
+            responseOutput: "fall back to local runner"
+        )
+        server.start()
+        defer { server.stop() }
+
+        let client = IPCClient(socketPath: tempSocketPath, token: "test-token")
+        let result = try client.send(command: .panicEvict, dryRun: false)
+
+        XCTAssertEqual(result.exitCode, 1)
+        XCTAssertEqual(result.output, "fall back to local runner")
+        XCTAssertEqual(server.capturedCommand, "panic-evict")
+    }
 }
 
 /// Minimal POSIX AF_UNIX listener that accepts one connection, captures
@@ -97,12 +114,16 @@ private final class CapturingServer {
     let socketPath: String
     private var listenFD: Int32 = -1
     private let lock = NSLock()
+    private let responseExitCode: Int
+    private let responseOutput: String
     private var _capturedAuth: String?
     private var _capturedCommand: String?
     private var _capturedDryRun: Bool?
 
-    init(socketPath: String) throws {
+    init(socketPath: String, responseExitCode: Int = 0, responseOutput: String = "ok") throws {
         self.socketPath = socketPath
+        self.responseExitCode = responseExitCode
+        self.responseOutput = responseOutput
         Darwin.unlink(socketPath)
 
         let fd = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
@@ -190,7 +211,10 @@ private final class CapturingServer {
             lock.unlock()
         }
 
-        let response = "{\"done\":true,\"exit_code\":0,\"output\":\"ok\"}\n"
+        let escapedOutput = responseOutput
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+        let response = "{\"done\":true,\"exit_code\":\(responseExitCode),\"output\":\"\(escapedOutput)\"}\n"
         if let responseData = response.data(using: .utf8) {
             _ = responseData.withUnsafeBytes { ptr in
                 Darwin.write(clientFD, ptr.baseAddress, responseData.count)

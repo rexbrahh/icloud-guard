@@ -242,6 +242,8 @@ final class PackageAwareEvictorTests: XCTestCase {
         // Non-ubiquitous files can't be evicted
         XCTAssertEqual(result.failedCount, 1)
         XCTAssertEqual(result.evictedCount, 0)
+        XCTAssertTrue(logger.messages.contains(where: { $0.contains("evict-failed role=file path=regular.txt") }))
+        XCTAssertTrue(logger.messages.contains(where: { $0.contains("allocated=") }))
     }
 
     private func makeSandbox() throws -> URL {

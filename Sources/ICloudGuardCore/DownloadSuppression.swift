@@ -32,14 +32,18 @@ public final class DownloadSuppression {
 
     /// Set the process I/O policy to prevent materialization of dataless files.
     /// Maps to the launchd `MaterializeDatalessFiles: false` key.
-    /// Verified working: `setiopolicy_np(IOPOL_TYPE_DISK, IOPOL_SCOPE_PROCESS, ...)` returns 0.
+    /// Uses the VFS materialization policy, not the generic disk throttle policy.
     private func applyIOPolicy() {
-        let result = setiopolicy_np(IOPOL_TYPE_DISK, IOPOL_SCOPE_PROCESS, IOPOL_DEFAULT)
+        let result = setiopolicy_np(
+            ioPolicyTypeVFSMaterializeDatalessFiles,
+            IOPOL_SCOPE_PROCESS,
+            ioPolicyMaterializeDatalessFilesOff
+        )
         if result != 0 {
             let err = String(cString: strerror(errno))
             logger.log("suppression iopolicy failed errno=\(errno) msg=\(err)")
         } else {
-            logger.log("suppression iopolicy set materializeDatalessFiles=false")
+            logger.log("suppression iopolicy set materializeDatalessFiles=off")
         }
     }
 
@@ -92,3 +96,6 @@ public final class DownloadSuppression {
         logger.log("suppression spotlight marker-removed path=\(markerURL.path)")
     }
 }
+
+private let ioPolicyTypeVFSMaterializeDatalessFiles: Int32 = 3
+private let ioPolicyMaterializeDatalessFilesOff: Int32 = 1

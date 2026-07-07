@@ -34,7 +34,7 @@ public final class GuardRunner {
 
     public init() {
         self.scannerFactory = { ICloudScanner() }
-        self.evictorFactory = { logger in Evictor(logger: logger) }
+        self.evictorFactory = { logger in PackageAwareEvictor(logger: logger) }
     }
 
     init(
@@ -650,39 +650,6 @@ private final class Notifier {
 
     private func escape(_ value: String) -> String {
         value.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
-    }
-}
-
-final class Evictor: ICloudEvicting {
-    private let fileManager = FileManager.default
-    private let logger: GuardLogging
-
-    init(logger: GuardLogging) {
-        self.logger = logger
-    }
-
-    func evict(items: [ICloudItemSnapshot], dryRun: Bool) throws -> EvictionResult {
-        if dryRun {
-            for item in items {
-                logger.log("dry-run evict \(item.relativePath) bytes=\(item.localBytes)")
-            }
-            return EvictionResult(evictedCount: 0, failedCount: 0)
-        }
-
-        var evictedCount = 0
-        var failedCount = 0
-        for item in items {
-            let url = URL(fileURLWithPath: item.absolutePath)
-            do {
-                try fileManager.evictUbiquitousItem(at: url)
-                evictedCount += 1
-                logger.log("evicted \(item.relativePath) bytes=\(item.localBytes)")
-            } catch {
-                failedCount += 1
-                logger.log("failed to evict \(item.relativePath): \(error)")
-            }
-        }
-        return EvictionResult(evictedCount: evictedCount, failedCount: failedCount)
     }
 }
 
