@@ -14,6 +14,7 @@ actor GuardService {
     private var networkMonitor: NWPathMonitor?
     private var networkEvictionDispatched = false
     private var isPaused = false
+    private var isEvicting = false
     private let eventHandler: (GuardServiceEvent) -> Void
 
     init(scopePath: String, eventHandler: @escaping (GuardServiceEvent) -> Void) {
@@ -68,6 +69,7 @@ actor GuardService {
 
     func pause() {
         isPaused = true
+        isEvicting = false
         pollutionTimer?.cancel()
         pollutionTimer = nil
         networkMonitor?.cancel()
@@ -79,6 +81,7 @@ actor GuardService {
 
     func resume() {
         isPaused = false
+        isEvicting = false
         let w = RematerializationWatcher(
             logger: logger,
             evictorFactory: { logger in PackageAwareEvictor(logger: logger) }
@@ -125,8 +128,13 @@ actor GuardService {
         config = newConfig
     }
 
+    // MARK: - Eviction (streaming — no URL array materialization)
+
     func runEviction() {
+        guard !isEvicting else { return }
+        isEvicting = true
         eventHandler(.evictionStarted)
+
         let handler = eventHandler
         let scope = scopePath
         let log = logger
@@ -135,27 +143,36 @@ actor GuardService {
         let protectedPaths = config.scope.protectedPaths
 
         Task.detached {
-            let urls = collectEvictableURLs(
-                scopePath: scope,
-                keys: [.isRegularFileKey, .isUbiquitousItemKey, .ubiquitousItemDownloadingStatusKey],
-                protectedPaths: protectedPaths,
-                requireMaterialized: true
-            )
-
+            let scopeURL = URL(fileURLWithPath: NSString(string: scope).expandingTildeInPath, isDirectory: true)
             var evicted = 0
             var failed = 0
             var reclaimed: Int64 = 0
             let fm = FileManager.default
 
-            for url in urls {
-                guard evicted + failed < batchLimit else { break }
-                let sizeBefore = fileSize(url: url)
-                do {
-                    try fm.evictUbiquitousItem(at: url)
-                    evicted += 1
-                    reclaimed += sizeBefore
-                } catch {
-                    failed += 1
+            if let enumerator = FileManager.default.enumerator(
+                at: scopeURL,
+                includingPropertiesForKeys: [.isRegularFileKey, .isUbiquitousItemKey, .ubiquitousItemDownloadingStatusKey],
+                options: [.skipsHiddenFiles]
+            ) {
+                for case let url as URL in enumerator {
+                    autoreleasepool {
+                        guard evicted + failed < batchLimit else { return }
+                        guard url.lastPathComponent.hasPrefix(".") == false else { return }
+                        if isProtected(url: url, protectedPaths: protectedPaths) { return }
+                        let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .isUbiquitousItemKey, .ubiquitousItemDownloadingStatusKey])
+                        guard values?.isRegularFile == true else { return }
+                        guard values?.isUbiquitousItem == true else { return }
+                        guard values?.ubiquitousItemDownloadingStatus == .current
+                            || values?.ubiquitousItemDownloadingStatus == .downloaded else { return }
+                        let sizeBefore = fileSize(url: url)
+                        do {
+                            try fm.evictUbiquitousItem(at: url)
+                            evicted += 1
+                            reclaimed += sizeBefore
+                        } catch {
+                            failed += 1
+                        }
+                    }
                 }
             }
 
@@ -164,40 +181,51 @@ actor GuardService {
             await Notifier.shared.notifyEvictionComplete(evictedCount: evicted, reclaimedBytes: reclaimed)
             handler(.evictionResult(evicted: evicted, reclaimed: reclaimed))
             handler(.evictionCompleted)
+            await self.clearEvicting()
         }
     }
 
     func panicEvict() {
+        guard !isEvicting else { return }
+        isEvicting = true
         eventHandler(.evictionStarted)
+
         let handler = eventHandler
         let scope = scopePath
-        let log = logger
+        let _ = logger
         let evLog = evictionLogger
         let panicLimit = config.eviction.panicLimit
         let protectedPaths = config.scope.protectedPaths
 
         Task.detached {
-            let urls = collectEvictableURLs(
-                scopePath: scope,
-                keys: [.isRegularFileKey, .isUbiquitousItemKey],
-                protectedPaths: protectedPaths,
-                requireMaterialized: false
-            )
-
+            let scopeURL = URL(fileURLWithPath: NSString(string: scope).expandingTildeInPath, isDirectory: true)
             var evicted = 0
             var failed = 0
             var reclaimed: Int64 = 0
             let fm = FileManager.default
 
-            for url in urls {
-                guard evicted + failed < panicLimit else { break }
-                let sizeBefore = fileSize(url: url)
-                do {
-                    try fm.evictUbiquitousItem(at: url)
-                    evicted += 1
-                    reclaimed += sizeBefore
-                } catch {
-                    failed += 1
+            if let enumerator = FileManager.default.enumerator(
+                at: scopeURL,
+                includingPropertiesForKeys: [.isRegularFileKey, .isUbiquitousItemKey],
+                options: [.skipsHiddenFiles]
+            ) {
+                for case let url as URL in enumerator {
+                    autoreleasepool {
+                        guard evicted + failed < panicLimit else { return }
+                        guard url.lastPathComponent.hasPrefix(".") == false else { return }
+                        if isProtected(url: url, protectedPaths: protectedPaths) { return }
+                        let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .isUbiquitousItemKey])
+                        guard values?.isRegularFile == true else { return }
+                        guard values?.isUbiquitousItem == true else { return }
+                        let sizeBefore = fileSize(url: url)
+                        do {
+                            try fm.evictUbiquitousItem(at: url)
+                            evicted += 1
+                            reclaimed += sizeBefore
+                        } catch {
+                            failed += 1
+                        }
+                    }
                 }
             }
 
@@ -205,6 +233,7 @@ actor GuardService {
             await Notifier.shared.notifyEvictionComplete(evictedCount: evicted, reclaimedBytes: reclaimed)
             handler(.evictionResult(evicted: evicted, reclaimed: reclaimed))
             handler(.evictionCompleted)
+            await self.clearEvicting()
         }
     }
 
@@ -215,20 +244,40 @@ actor GuardService {
         let handler = eventHandler
 
         Task.detached {
-            let urls = collectEvictableURLs(
-                scopePath: scope,
-                keys: [.isRegularFileKey, .isUbiquitousItemKey, .ubiquitousItemDownloadingStatusKey],
-                protectedPaths: protectedPaths,
-                requireMaterialized: true
-            )
-            let count = min(urls.count, batchLimit)
-            let totalBytes = urls.prefix(batchLimit).reduce(Int64(0)) { $0 + fileSize(url: $1) }
+            let scopeURL = URL(fileURLWithPath: NSString(string: scope).expandingTildeInPath, isDirectory: true)
+            var count = 0
+            var totalBytes: Int64 = 0
+
+            if let enumerator = FileManager.default.enumerator(
+                at: scopeURL,
+                includingPropertiesForKeys: [.isRegularFileKey, .isUbiquitousItemKey, .ubiquitousItemDownloadingStatusKey],
+                options: [.skipsHiddenFiles]
+            ) {
+                for case let url as URL in enumerator {
+                    autoreleasepool {
+                        guard count < batchLimit else { return }
+                        guard url.lastPathComponent.hasPrefix(".") == false else { return }
+                        if isProtected(url: url, protectedPaths: protectedPaths) { return }
+                        let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .isUbiquitousItemKey, .ubiquitousItemDownloadingStatusKey])
+                        guard values?.isRegularFile == true else { return }
+                        guard values?.isUbiquitousItem == true else { return }
+                        guard values?.ubiquitousItemDownloadingStatus == .current
+                            || values?.ubiquitousItemDownloadingStatus == .downloaded else { return }
+                        count += 1
+                        totalBytes += fileSize(url: url)
+                    }
+                }
+            }
+
             handler(.evictionResult(evicted: 0, reclaimed: totalBytes))
         }
     }
 
     func evictFolder(_ folderPath: String) {
+        guard !isEvicting else { return }
+        isEvicting = true
         eventHandler(.evictionStarted)
+
         let handler = eventHandler
         let log = logger
         let evLog = evictionLogger
@@ -237,33 +286,33 @@ actor GuardService {
 
         Task.detached {
             let scopeURL = URL(fileURLWithPath: NSString(string: folderPath).expandingTildeInPath, isDirectory: true)
-            guard let enumerator = FileManager.default.enumerator(
-                at: scopeURL,
-                includingPropertiesForKeys: [.isRegularFileKey, .isUbiquitousItemKey, .ubiquitousItemDownloadingStatusKey],
-                options: [.skipsHiddenFiles]
-            ) else { handler(.evictionCompleted); return }
-
             var evicted = 0
             var failed = 0
             var reclaimed: Int64 = 0
             let fm = FileManager.default
 
-            autoreleasepool {
+            if let enumerator = FileManager.default.enumerator(
+                at: scopeURL,
+                includingPropertiesForKeys: [.isRegularFileKey, .isUbiquitousItemKey, .ubiquitousItemDownloadingStatusKey],
+                options: [.skipsHiddenFiles]
+            ) {
                 for case let url as URL in enumerator {
-                    guard evicted + failed < batchLimit else { break }
-                    guard url.lastPathComponent.hasPrefix(".") == false else { continue }
-                    if isProtected(url: url, protectedPaths: protectedPaths) { continue }
-                    let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .isUbiquitousItemKey, .ubiquitousItemDownloadingStatusKey])
-                    guard values?.isRegularFile == true else { continue }
-                    guard values?.isUbiquitousItem == true else { continue }
-                    guard values?.ubiquitousItemDownloadingStatus == .current
-                        || values?.ubiquitousItemDownloadingStatus == .downloaded else { continue }
-                    let sizeBefore = fileSize(url: url)
-                    do {
-                        try fm.evictUbiquitousItem(at: url)
-                        evicted += 1
-                        reclaimed += sizeBefore
-                    } catch { failed += 1 }
+                    autoreleasepool {
+                        guard evicted + failed < batchLimit else { return }
+                        guard url.lastPathComponent.hasPrefix(".") == false else { return }
+                        if isProtected(url: url, protectedPaths: protectedPaths) { return }
+                        let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .isUbiquitousItemKey, .ubiquitousItemDownloadingStatusKey])
+                        guard values?.isRegularFile == true else { return }
+                        guard values?.isUbiquitousItem == true else { return }
+                        guard values?.ubiquitousItemDownloadingStatus == .current
+                            || values?.ubiquitousItemDownloadingStatus == .downloaded else { return }
+                        let sizeBefore = fileSize(url: url)
+                        do {
+                            try fm.evictUbiquitousItem(at: url)
+                            evicted += 1
+                            reclaimed += sizeBefore
+                        } catch { failed += 1 }
+                    }
                 }
             }
 
@@ -272,13 +321,18 @@ actor GuardService {
             await Notifier.shared.notifyEvictionComplete(evictedCount: evicted, reclaimedBytes: reclaimed)
             handler(.evictionResult(evicted: evicted, reclaimed: reclaimed))
             handler(.evictionCompleted)
+            await self.clearEvicting()
         }
     }
+
+    // MARK: - Rematerialization handling
 
     private func handleRematerialization(_ event: RematerializationEvent) async {
         await Notifier.shared.notifyRematerialization(path: event.itemPath)
         eventHandler(.rematerializationDetected(event))
     }
+
+    // MARK: - Network monitor
 
     private func startNetworkMonitor() {
         let monitor = NWPathMonitor()
@@ -301,6 +355,8 @@ actor GuardService {
     private func setNetworkDispatched(_ value: Bool) {
         networkEvictionDispatched = value
     }
+
+    // MARK: - Pollution check
 
     private func schedulePollutionCheck() {
         let interval = config.watcher.pollutionCheckIntervalSeconds
@@ -326,11 +382,13 @@ actor GuardService {
             options: [.skipsHiddenFiles]
         ) else { return }
 
-        autoreleasepool {
-            for case let url as URL in enumerator {
-                guard url.lastPathComponent.hasPrefix(".") == false else { continue }
+        let scopePrefix = scopeURL.path + "/"
+
+        for case let url as URL in enumerator {
+            autoreleasepool {
+                guard url.lastPathComponent.hasPrefix(".") == false else { return }
                 var st = stat()
-                guard lstat(url.path, &st) == 0 else { continue }
+                guard lstat(url.path, &st) == 0 else { return }
 
                 let isDataless = (st.st_flags & SF_DATALESS) != 0
                 if isDataless {
@@ -339,14 +397,14 @@ actor GuardService {
                     materialized += 1
                 }
 
-                // Track top-level folder sizes
-                let relPath = url.path.replacingOccurrences(of: scopeURL.path + "/", with: "")
-                let topFolder = relPath.split(separator: "/").first.map(String.init) ?? "(root)"
+                // Track top-level folder sizes — compute once per iteration
                 if !isDataless {
+                    let relPath = url.path.replacingOccurrences(of: scopePrefix, with: "")
+                    let topFolder = relPath.split(separator: "/").first.map(String.init) ?? "(root)"
                     folderSizes[topFolder, default: 0] += Int64(st.st_blocks) * 512
                 }
 
-                if materialized + dataless >= 10000 { break }
+                if materialized + dataless >= 10000 { return }
             }
         }
 
@@ -364,13 +422,17 @@ actor GuardService {
 
         eventHandler(.pollutionUpdated(materialized: materialized, dataless: dataless, freeSpace: freeBytes, folders: Array(topFolders)))
 
-        // Auto-evict on low disk
+        // Auto-evict on low disk — guarded against concurrent evictions
         let freeGiB = Double(freeBytes) / (1024 * 1024 * 1024)
-        if !isPaused && freeGiB > 0 && freeGiB < Double(config.policy.remediateFreeGiB) {
-            eventHandler(.evictionStarted)
-            await runEviction()
-            eventHandler(.evictionCompleted)
+        if !isPaused && !isEvicting && freeGiB > 0 && freeGiB < Double(config.policy.remediateFreeGiB) {
+            runEviction()
         }
+    }
+
+    // MARK: - State management
+
+    private func clearEvicting() {
+        isEvicting = false
     }
 }
 
@@ -394,60 +456,17 @@ private func fileSize(url: URL) -> Int64 {
     return Int64(st.st_blocks) * 512
 }
 
-private func collectEvictableURLs(
-    scopePath: String,
-    keys: [URLResourceKey],
-    protectedPaths: [String],
-    requireMaterialized: Bool
-) -> [URL] {
-    let scopeURL = URL(fileURLWithPath: NSString(string: scopePath).expandingTildeInPath, isDirectory: true)
-
-    guard let enumerator = FileManager.default.enumerator(
-        at: scopeURL,
-        includingPropertiesForKeys: keys,
-        options: [.skipsHiddenFiles]
-    ) else { return [] }
-
-    var result: [URL] = []
-
-    autoreleasepool {
-        for case let url as URL in enumerator {
-            guard url.lastPathComponent.hasPrefix(".") == false else { continue }
-            if isProtected(url: url, protectedPaths: protectedPaths) { continue }
-
-            let values = try? url.resourceValues(forKeys: Set(keys))
-
-            if requireMaterialized {
-                guard values?.isRegularFile == true else { continue }
-                guard values?.isUbiquitousItem == true else { continue }
-                guard values?.ubiquitousItemDownloadingStatus == .current
-                    || values?.ubiquitousItemDownloadingStatus == .downloaded else { continue }
-            } else {
-                guard values?.isRegularFile == true else { continue }
-                guard values?.isUbiquitousItem == true else { continue }
-            }
-
-            result.append(url)
-        }
-    }
-
-    return result
-}
-
 private func isProtected(url: URL, protectedPaths: [String]) -> Bool {
     let path = url.path
     for protected in protectedPaths {
         let expanded = NSString(string: protected).expandingTildeInPath
-        // Exact path or prefix match
         if path == expanded || path.hasPrefix(expanded + "/") {
             return true
         }
-        // Glob pattern match (e.g. *.fcpbundle, Documents/**)
         if expanded.contains("*") || expanded.contains("?") {
             if fnmatch(expanded, path, 0) == 0 {
                 return true
             }
-            // Also match as relative path against URL components
             let relPath = url.lastPathComponent
             if fnmatch(expanded, relPath, 0) == 0 {
                 return true
