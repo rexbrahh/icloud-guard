@@ -27,11 +27,24 @@ final class GuardViewModel: ObservableObject {
     @Published var topFolders: [(name: String, bytes: Int64)] = []
 
     private var guardService: GuardService?
+    private var evictObserver: NSObjectProtocol?
 
     init() {
         loadLifetimeStats()
+        evictObserver = NotificationCenter.default.addObserver(
+            forName: .icloudGuardEvict,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in self?.runEviction() }
+        }
     }
 
+    deinit {
+        if let observer = evictObserver {
+            NotificationCenter.default.removeObserver(observer)
+        }
+    }
     // MARK: - Status
 
     var statusIcon: String {
@@ -114,10 +127,12 @@ final class GuardViewModel: ObservableObject {
             watcherActive = true
         case .watcherStopped:
             watcherActive = false
-        case .rematerializationDetected(let event):
-            rematerializationCount += 1
-            lastRematerializationPath = event.itemPath
-            lastRematerializationTime = event.detectedAt
+        case .rematerializationBatchDetected(let events):
+            rematerializationCount += events.count
+            if let last = events.last {
+                lastRematerializationPath = last.itemPath
+                lastRematerializationTime = last.detectedAt
+            }
         case .evictionStarted:
             isEvicting = true
         case .evictionCompleted:
@@ -190,7 +205,7 @@ enum GuardServiceEvent {
     case suppressionApplied
     case watcherStarted
     case watcherStopped
-    case rematerializationDetected(RematerializationEvent)
+    case rematerializationBatchDetected([RematerializationEvent])
     case evictionStarted
     case evictionCompleted
     case error(String)

@@ -44,8 +44,8 @@ actor GuardService {
             logger: logger,
             evictorFactory: { logger in PackageAwareEvictor(logger: logger) }
         )
-        w.onRematerialization = { [weak self] event in
-            Task { [weak self] in await self?.handleRematerialization(event) }
+        w.onRematerializationBatch = { [weak self] events in
+            Task { [weak self] in await self?.handleRematerializationBatch(events) }
         }
         w.start()
         watcher = w
@@ -86,8 +86,8 @@ actor GuardService {
             logger: logger,
             evictorFactory: { logger in PackageAwareEvictor(logger: logger) }
         )
-        w.onRematerialization = { [weak self] event in
-            Task { [weak self] in await self?.handleRematerialization(event) }
+        w.onRematerializationBatch = { [weak self] events in
+            Task { [weak self] in await self?.handleRematerializationBatch(events) }
         }
         w.start()
         watcher = w
@@ -327,9 +327,14 @@ actor GuardService {
 
     // MARK: - Rematerialization handling
 
-    private func handleRematerialization(_ event: RematerializationEvent) async {
-        await Notifier.shared.notifyRematerialization(path: event.itemPath)
-        eventHandler(.rematerializationDetected(event))
+    private func handleRematerializationBatch(_ events: [RematerializationEvent]) async {
+        guard !events.isEmpty else { return }
+        // Single notification for the batch (Notifier already throttles internally)
+        if let lastEvent = events.last {
+            await Notifier.shared.notifyRematerialization(path: lastEvent.itemPath)
+        }
+        // Single event with the batch — avoids N MainActor dispatches
+        eventHandler(.rematerializationBatchDetected(events))
     }
 
     // MARK: - Network monitor

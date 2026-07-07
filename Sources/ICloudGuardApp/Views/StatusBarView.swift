@@ -173,10 +173,6 @@ struct StatusBarView: View {
         .frame(width: 280)
         .onAppear {
             viewModel.startGuardService(scopePath: configModel.config.scope.path)
-            // Listen for global hotkey Cmd+Shift+E
-            NotificationCenter.default.addObserver(forName: .icloudGuardEvict, object: nil, queue: .main) { _ in
-                viewModel.runEviction()
-            }
         }
     }
 

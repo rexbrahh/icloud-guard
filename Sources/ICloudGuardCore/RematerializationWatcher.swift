@@ -8,8 +8,9 @@ import Foundation
 /// fighting `fileproviderd` in a tight loop.
 ///
 /// Re-evictions and callbacks are coalesced: pending URLs are deduplicated into a `Set`,
-/// and a single timer-driven flush processes the entire batch with one evictor instance.
-/// This prevents actor mailbox explosion and dispatch pileup under heavy CloudKit sync.
+/// and a single timer-driven flush processes the entire batch with one evictor instance
+/// and one callback invocation. This prevents actor mailbox explosion and dispatch pileup
+/// under heavy CloudKit sync.
 public final class RematerializationWatcher {
     private let logger: GuardLogging
     private let evictorFactory: (GuardLogging) -> ICloudEvicting
@@ -24,9 +25,10 @@ public final class RematerializationWatcher {
     private var pendingReEvictions: Set<String> = []
     private var pendingEvents: [RematerializationEvent] = []
     private var coalesceTimer: DispatchSourceTimer?
-    private var coalesceScheduled = false
+    private var pendingReEvictWorkItem: DispatchWorkItem?
 
-    public var onRematerialization: ((RematerializationEvent) -> Void)?
+    /// Batch callback: receives all coalesced events in one invocation.
+    public var onRematerializationBatch: (([RematerializationEvent]) -> Void)?
 
     public init(logger: GuardLogging, evictorFactory: @escaping (GuardLogging) -> ICloudEvicting) {
         self.logger = logger
@@ -76,7 +78,8 @@ public final class RematerializationWatcher {
         self.query = nil
         coalesceTimer?.cancel()
         coalesceTimer = nil
-        coalesceScheduled = false
+        pendingReEvictWorkItem?.cancel()
+        pendingReEvictWorkItem = nil
         pendingReEvictions.removeAll()
         pendingEvents.removeAll()
         logger.log("watcher stopped rematerializationCount=\(rematerializationCount)")
@@ -147,11 +150,8 @@ public final class RematerializationWatcher {
 
         guard !events.isEmpty else { return }
 
-        // Notify the callback for each event (GuardService spawns a single Task
-        // cluster inside a tight loop — caller should batch internally if needed)
-        for event in events {
-            onRematerialization?(event)
-        }
+        // Single batch callback — caller handles all events in one Task
+        onRematerializationBatch?(events)
 
         // Schedule a single re-eviction for all pending URLs with backoff delay
         let backoff = backoffSeconds
@@ -159,7 +159,10 @@ public final class RematerializationWatcher {
         let factory = evictorFactory
         let count = rematerializationCount
 
-        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + backoff) {
+        // Cancel any previous pending re-evict work item
+        pendingReEvictWorkItem?.cancel()
+
+        let workItem = DispatchWorkItem {
             let evictor = factory(log)
             let now = Date()
 
@@ -197,5 +200,8 @@ public final class RematerializationWatcher {
 
             log.log("watcher re-evict-batch urls=\(urls.count) evicted=\(evicted) failed=\(failed) totalCount=\(count)")
         }
+
+        pendingReEvictWorkItem = workItem
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + backoff, execute: workItem)
     }
 }

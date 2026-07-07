@@ -528,6 +528,10 @@ public final class GuardRunner {
 public final class Logger: GuardLogging {
     private let logURL: URL
     private let formatter = ISO8601DateFormatter()
+    private let queue = DispatchQueue(label: "icloud-guard.logger", qos: .utility)
+    private var fileHandle: FileHandle?
+    private var bytesWritten: Int64 = 0
+    private let maxFileSize: Int64 = 10 * 1024 * 1024
 
     public init(logPath: String) {
         self.logURL = URL(fileURLWithPath: NSString(string: logPath).expandingTildeInPath)
@@ -537,31 +541,49 @@ public final class Logger: GuardLogging {
         let rendered = "[\(formatter.string(from: Date()))] \(message)\n"
         fputs(rendered, stdout)
 
-        do {
-            try FileManager.default.createDirectory(at: logURL.deletingLastPathComponent(), withIntermediateDirectories: true)
-            rotateIfNeeded()
-            if !FileManager.default.fileExists(atPath: logURL.path) {
-                FileManager.default.createFile(atPath: logURL.path, contents: nil)
+        queue.sync {
+            ensureHandle()
+            // Check rotation BEFORE writing (matches original behavior)
+            if bytesWritten >= maxFileSize {
+                rotate()
             }
-            let handle = try FileHandle(forWritingTo: logURL)
-            try handle.seekToEnd()
-            if let data = rendered.data(using: .utf8) {
+            guard let handle = fileHandle else { return }
+            guard let data = rendered.data(using: .utf8) else { return }
+            do {
                 try handle.write(contentsOf: data)
+                bytesWritten += Int64(data.count)
+            } catch {
+                // Handle may be stale (external rotation) — reopen on next call
+                fileHandle = nil
+                fputs("[icloud-guard] log write failed: \(error)\n", stderr)
             }
-            try handle.close()
-        } catch {
-            fputs("[icloud-guard] failed to append to log: \(error)\n", stderr)
         }
     }
 
-    private func rotateIfNeeded() {
-        let attrs = try? FileManager.default.attributesOfItem(atPath: logURL.path)
-        let size = (attrs?[.size] as? NSNumber)?.int64Value ?? 0
-        if size >= 10 * 1024 * 1024 {
-            let backupPath = logURL.path + ".1"
-            try? FileManager.default.removeItem(atPath: backupPath)
-            try? FileManager.default.moveItem(atPath: logURL.path, toPath: backupPath)
+    private func ensureHandle() {
+        guard fileHandle == nil else { return }
+        try? FileManager.default.createDirectory(at: logURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        if !FileManager.default.fileExists(atPath: logURL.path) {
+            FileManager.default.createFile(atPath: logURL.path, contents: nil)
         }
+        guard let handle = try? FileHandle(forWritingTo: logURL) else { return }
+        let endOffset = (try? handle.seekToEnd()) ?? 0
+        bytesWritten = Int64(endOffset)
+        fileHandle = handle
+    }
+
+    private func rotate() {
+        try? fileHandle?.close()
+        fileHandle = nil
+        let backupPath = logURL.path + ".1"
+        try? FileManager.default.removeItem(atPath: backupPath)
+        try? FileManager.default.moveItem(atPath: logURL.path, toPath: backupPath)
+        bytesWritten = 0
+        ensureHandle()
+    }
+
+    deinit {
+        try? fileHandle?.close()
     }
 }
 
