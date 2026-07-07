@@ -40,15 +40,15 @@ jobs:
           echo "version=$VERSION" >> $GITHUB_OUTPUT
           echo "Beta version: $VERSION"
 
-      - name: Create zip
-        run: |
-          cd .build
-          zip -r ICloudGuard-beta-${{ steps.version.outputs.version }}.zip ICloudGuard.app
-
       - name: Update Info.plist version
         run: |
           plutil -replace CFBundleShortVersionString -string "${{ steps.version.outputs.version }}" .build/ICloudGuard.app/Contents/Info.plist
           plutil -replace CFBundleVersion -string "${{ github.run_number }}" .build/ICloudGuard.app/Contents/Info.plist
+
+      - name: Create zip
+        run: |
+          cd .build
+          zip -r ICloudGuard-beta-${{ steps.version.outputs.version }}.zip ICloudGuard.app
 
       - name: Create beta release
         uses: softprops/action-gh-release@v2

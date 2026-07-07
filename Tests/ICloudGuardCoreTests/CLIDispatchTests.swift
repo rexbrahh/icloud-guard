@@ -58,6 +58,6 @@ final class CLIDispatchTests: XCTestCase {
 
         let (code, output) = runCLI(args: ["--version"])
         XCTAssertEqual(code, 0, "icloud-guard --version should exit 0")
-        XCTAssertTrue(output.contains("0.3.0"), "Version should be 0.3.0")
+        XCTAssertTrue(output.contains("0.4.1"), "Version should be 0.4.1")
     }
 }
