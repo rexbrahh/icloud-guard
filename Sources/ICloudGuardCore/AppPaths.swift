@@ -34,8 +34,6 @@ public enum AppPaths {
     /// Eviction log: `~/.icloud-guard/evictions.log`
     public static var evictionLog: URL { homeDir.appendingPathComponent("evictions.log") }
 
-    /// Stats file (JSONL): `~/.icloud-guard/stats.jsonl`
-    public static var stats: URL { homeDir.appendingPathComponent("stats.jsonl") }
 
     /// Run lock: `~/.icloud-guard/run.lock`
     public static var lock: URL { homeDir.appendingPathComponent("run.lock") }

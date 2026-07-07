@@ -22,13 +22,13 @@ final class AppConfigModel {
     var onChange: (() -> Void)?
 
     private let store: ConfigStore
+    private var persistWorkItem: DispatchWorkItem?
 
     init(store: ConfigStore? = nil) {
         let resolvedStore = store ?? ConfigStore()
         self.store = resolvedStore
         self.config = resolvedStore.load()
     }
-
     func updateSuppression(_ suppression: AppConfig.SuppressionConfig) {
         config.suppression = suppression
         persist()
@@ -60,12 +60,20 @@ final class AppConfigModel {
     }
 
     private func persist() {
-        do {
-            try store.save(config)
-        } catch {
-            let line = "AppConfigModel: save failed: \(error)\n"
-            FileHandle.standardError.write(Data(line.utf8))
+        // Debounce: cancel any pending write and schedule a new one 500ms later.
+        // This prevents a stepper hold from writing TOML to disk on every increment.
+        persistWorkItem?.cancel()
+        let item = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            do {
+                try self.store.save(self.config)
+            } catch {
+                let line = "AppConfigModel: save failed: \(error)\n"
+                FileHandle.standardError.write(Data(line.utf8))
+            }
+            self.onChange?()
         }
-        onChange?()
+        persistWorkItem = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5, execute: item)
     }
 }

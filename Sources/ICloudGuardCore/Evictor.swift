@@ -122,25 +122,4 @@ public final class PackageAwareEvictor: ICloudEvicting {
             fileSize: logicalSize
         )
     }
-
-    /// Pause sync on an individual leaf file inside a package to prevent
-    /// `bird` from re-downloading it on CloudKit push.
-    ///
-    /// NOTE: `pauseSyncForUbiquitousItem` is NOT available for package directories
-    /// (Apple restriction). It only works on individual files. Apply per-leaf.
-    public func pauseSyncOnLeafFiles(in packageURL: URL) {
-        guard let enumerator = fileManager.enumerator(
-            at: packageURL,
-            includingPropertiesForKeys: [.isRegularFileKey, .isUbiquitousItemKey],
-            options: [.skipsHiddenFiles]
-        ) else { return }
-
-        for case let childURL as URL in enumerator {
-            let values = try? childURL.resourceValues(forKeys: [.isRegularFileKey, .isUbiquitousItemKey])
-            guard values?.isRegularFile == true, values?.isUbiquitousItem == true else { continue }
-
-        // pauseSync(forUbiquitousItem:) is not available in the current SDK.
-        // The rematerialization watcher handles re-eviction instead.
-    }
-}
 }

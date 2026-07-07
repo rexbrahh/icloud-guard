@@ -90,19 +90,27 @@ final class GuardViewModel: ObservableObject {
     }
 
     var freeSpaceLabel: String {
+        Self.byteFormatter.string(fromByteCount: freeSpaceBytes)
+    }
+
+    private static let byteFormatter: ByteCountFormatter = {
         let f = ByteCountFormatter()
         f.allowedUnits = [.useGB, .useMB]
         f.countStyle = .file
-        return f.string(fromByteCount: freeSpaceBytes)
-    }
+        return f
+    }()
 
     var lifetimeLabel: String {
+        let reclaimed = Self.lifetimeFormatter.string(fromByteCount: lifetimeReclaimedBytes)
+        return "\(lifetimeEvictedCount) files, \(reclaimed) reclaimed"
+    }
+
+    private static let lifetimeFormatter: ByteCountFormatter = {
         let f = ByteCountFormatter()
         f.allowedUnits = [.useGB, .useMB, .useKB]
         f.countStyle = .file
-        let reclaimed = f.string(fromByteCount: lifetimeReclaimedBytes)
-        return "\(lifetimeEvictedCount) files, \(reclaimed) reclaimed"
-    }
+        return f
+    }()
 
     // MARK: - Service
 

@@ -176,10 +176,14 @@ struct StatusBarView: View {
         }
     }
 
-    private func formatBytes(_ bytes: Int64) -> String {
+    private static let byteFormatter: ByteCountFormatter = {
         let f = ByteCountFormatter()
         f.allowedUnits = [.useGB, .useMB, .useKB]
         f.countStyle = .file
-        return f.string(fromByteCount: bytes)
+        return f
+    }()
+
+    private func formatBytes(_ bytes: Int64) -> String {
+        Self.byteFormatter.string(fromByteCount: bytes)
     }
 }

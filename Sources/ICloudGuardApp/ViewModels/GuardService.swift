@@ -345,9 +345,9 @@ actor GuardService {
             guard path.status == .satisfied else { return }
             Task { [weak self] in
                 guard let self else { return }
-                let already = await self.networkEvictionDispatched
-                guard !already else { return }
-                await self.setNetworkDispatched(true)
+                // Atomic check-and-set: prevents TOCTOU race during network flapping
+                let already = await self.tryClaimNetworkDispatch()
+                guard already else { return }
                 try? await Task.sleep(nanoseconds: 30_000_000_000)
                 await self.runEviction()
                 await self.setNetworkDispatched(false)
@@ -355,6 +355,16 @@ actor GuardService {
         }
         monitor.start(queue: DispatchQueue.global(qos: .utility))
         networkMonitor = monitor
+    }
+
+    /// Atomically check if network eviction is already dispatched and claim if not.
+    /// Returns true if the caller should proceed, false if another task already claimed it.
+    private func tryClaimNetworkDispatch() -> Bool {
+        if networkEvictionDispatched {
+            return false
+        }
+        networkEvictionDispatched = true
+        return true
     }
 
     private func setNetworkDispatched(_ value: Bool) {
