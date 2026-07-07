@@ -22,7 +22,7 @@ struct CLIEntrypoint: ParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "icloud-guard",
         abstract: "iCloud Guard CLI — control the menu bar app from the command line",
-        version: "0.4.1",
+        version: "0.4.2",
         subcommands: [Status.self, Evict.self, PanicEvict.self, Config.self]
     )
 

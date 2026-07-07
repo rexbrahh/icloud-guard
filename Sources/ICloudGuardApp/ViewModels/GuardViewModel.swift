@@ -36,7 +36,7 @@ final class GuardViewModel: ObservableObject {
             object: nil,
             queue: .main
         ) { [weak self] _ in
-            Task { @MainActor in self?.runEviction() }
+            Task { @MainActor [weak self] in self?.runEviction() }
         }
     }
 
@@ -117,7 +117,7 @@ final class GuardViewModel: ObservableObject {
     func startGuardService(scopePath: String) {
         guard guardService == nil else { return }
         let service = GuardService(scopePath: scopePath) { [weak self] event in
-            Task { @MainActor in self?.handleServiceEvent(event) }
+            Task { @MainActor [weak self] in self?.handleServiceEvent(event) }
         }
         guardService = service
         Task { await service.start() }
