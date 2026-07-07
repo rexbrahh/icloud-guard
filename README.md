@@ -72,6 +72,63 @@ what it _can_ do: eliminate the spotlight trigger, eliminate the quicklook trigg
 
 ## installation
 
+### requirements
+
+- macos 14+ (sonoma or later — required for `@Environment(\.openSettings)`)
+- icloud drive enabled
+- "optimize mac storage" turned on in system settings → apple id → icloud
+
+swift 5.10+ / xcode 15+ is only needed when building from source.
+
+### homebrew cask (recommended)
+
+the easiest install path is the dedicated tap:
+
+```bash
+brew tap rexbrahh/tap
+brew install --cask icloud-guard
+open /Applications/ICloudGuard.app
+```
+
+the cask installs the notarized app bundle into `/Applications`.
+
+to upgrade later:
+
+```bash
+brew update
+brew upgrade --cask icloud-guard
+```
+
+to uninstall the app but keep your config/logs:
+
+```bash
+brew uninstall --cask icloud-guard
+```
+
+to uninstall the app and remove icloud guard's local state:
+
+```bash
+brew uninstall --cask --zap icloud-guard
+```
+
+the zap step removes `~/.icloud-guard`.
+
+### github release zip
+
+download the latest notarized beta from:
+
+```text
+https://github.com/rexbrahh/icloud-guard/releases
+```
+
+then:
+
+1. unzip `ICloudGuard-beta-<version>.zip`
+2. drag `ICloudGuard.app` into `/Applications`
+3. open `/Applications/ICloudGuard.app`
+
+if macos says the app is damaged, you are almost certainly using an old pre-notarization build. download `0.4.4` or newer.
+
 ### from source
 
 ```bash
@@ -81,12 +138,7 @@ cd icloud-guard
 open ~/Applications/ICloudGuard.app
 ```
 
-### requirements
-
-- macos 14+ (sonoma or later — required for `@Environment(\.openSettings)`)
-- swift 5.10+ (xcode 15+)
-- icloud drive enabled
-- "optimize mac storage" turned on in system settings → apple id → icloud
+source installs copy the app to `~/Applications/ICloudGuard.app` and install a convenience cli wrapper at `~/bin/icloud-guard`.
 
 ### config
 
@@ -103,6 +155,7 @@ batch_limit = 500
 panic_limit = 2000
 
 [watcher]
+metadata_watcher_enabled = false
 backoff_max_seconds = 60
 pollution_check_interval_seconds = 300
 
@@ -126,6 +179,160 @@ all app files live under `~/.icloud-guard/` — config, logs, future state. noth
 
 tip and beta releases are available in this repo. tip releases are built from every tip commit that lands on main that passes CI, builds and gets packaged successfully. beta releases are more polished, sporadic, when i think it's good enough for a certain standard with respect to goals i set for myself on this tool. you can find them in releases in this gh repo.
 
+beta releases are developer id signed, hardened-runtime enabled, notarized, and stapled before the zip is uploaded. the release zip is what the homebrew cask points at.
+
+### updating
+
+homebrew users:
+
+```bash
+brew update
+brew upgrade --cask icloud-guard
+```
+
+manual zip users:
+
+1. quit icloud guard from the menu bar
+2. download the newer release zip
+3. replace `/Applications/ICloudGuard.app`
+4. open the new app
+
+source users:
+
+```bash
+cd icloud-guard
+git pull
+./scripts/build-app.sh --release --install
+open ~/Applications/ICloudGuard.app
+```
+
+### uninstalling
+
+quit icloud guard first from the menu bar.
+
+homebrew:
+
+```bash
+brew uninstall --cask icloud-guard
+```
+
+manual install:
+
+```bash
+rm -rf /Applications/ICloudGuard.app
+```
+
+source install:
+
+```bash
+rm -rf ~/Applications/ICloudGuard.app
+rm -f ~/bin/icloud-guard
+```
+
+remove all local config, logs, socket files, tokens, and state:
+
+```bash
+rm -rf ~/.icloud-guard
+```
+
+do not run that last command if you want to preserve policy settings, protected paths, or historical logs.
+
+### maintenance and troubleshooting
+
+common paths:
+
+```text
+~/.icloud-guard/config.toml       # editable config
+~/.icloud-guard/icloud-guard.log  # app/service log
+~/.icloud-guard/evictions.log     # eviction history
+~/.icloud-guard/guard.sock        # cli socket
+~/.icloud-guard/guard.token       # cli auth token, mode 0600
+~/.icloud-guard/icloud-guard.pid  # gui pid marker
+~/.icloud-guard/run.lock          # run lock
+```
+
+use these when debugging:
+
+```bash
+/Applications/ICloudGuard.app/Contents/MacOS/ICloudGuard status
+/Applications/ICloudGuard.app/Contents/MacOS/ICloudGuard evict --dry-run
+/Applications/ICloudGuard.app/Contents/MacOS/ICloudGuard config show
+tail -f ~/.icloud-guard/icloud-guard.log
+tail -f ~/.icloud-guard/evictions.log
+```
+
+if you built from source with `./scripts/build-app.sh --install`, you can use `~/bin/icloud-guard` instead of the full `/Applications/...` path.
+
+if the cli cannot reach the menu bar app, it falls back to running the engine in-process. if you suspect stale ipc state:
+
+```bash
+rm -f ~/.icloud-guard/guard.sock ~/.icloud-guard/icloud-guard.pid ~/.icloud-guard/run.lock
+open /Applications/ICloudGuard.app
+```
+
+if the app appears to do nothing, check:
+
+- icloud drive is enabled
+- optimize mac storage is enabled
+- the configured scope points at `~/Library/Mobile Documents/com~apple~CloudDocs`
+- protected paths do not cover everything you expect to evict
+- `trim_local_gib` is greater than `target_local_gib`; invalid values are normalized, but clear thresholds are easier to reason about
+
+if memory or cpu looks suspicious:
+
+```bash
+pgrep -afil 'ICloudGuard|icloud-guard'
+ps -axo pid,pcpu,rss,etime,command | grep -i ICloudGuard
+vmmap -summary <pid> | grep -E 'Physical footprint|MALLOC|TOTAL'
+```
+
+### maintainer release checklist
+
+1. bump the app version in:
+   - `Sources/ICloudGuardApp/Resources/Info.plist`
+   - `Sources/ICloudGuardCLI/main.swift`
+   - `Sources/ICloudGuardApp/Views/SettingsView.swift`
+   - `Tests/ICloudGuardCoreTests/CLIDispatchTests.swift`
+2. run:
+
+```bash
+swift test
+swift build -c release --product icloud-guard
+./scripts/build-app.sh --release
+```
+
+3. create and push a beta tag:
+
+```bash
+git tag -a beta-<version> -m "Beta <version>"
+git push origin main
+git push origin beta-<version>
+```
+
+4. wait for the beta release workflow to pass. it must sign, notarize, staple, zip, and upload the app.
+5. download the release zip and verify:
+
+```bash
+unzip ICloudGuard-beta-<version>.zip
+codesign --verify --deep --strict --verbose=2 ICloudGuard.app
+codesign --check-notarization --verbose=4 ICloudGuard.app
+codesign -dv --verbose=4 ICloudGuard.app 2>&1 | grep -E 'Authority|TeamIdentifier|Notarization'
+```
+
+6. update the tap repo:
+
+```bash
+cd ~/homebrew-tap
+shasum -a 256 ~/Downloads/ICloudGuard-beta-<version>.zip
+$EDITOR Casks/icloud-guard.rb
+brew install --cask --dry-run rexbrahh/tap/icloud-guard
+git add Casks/icloud-guard.rb
+git commit -m "Update iCloud Guard to <version>"
+git push
+```
+
+homebrew users will then get the update with `brew update && brew upgrade --cask icloud-guard`.
+
 ## the menu bar
 
 the dropdown shows:
@@ -143,7 +350,13 @@ icloud guard comes with a full cli that talks to the running menu bar app via a 
 
 ### installation
 
-the cli wrapper is installed automatically when you run `./scripts/build-app.sh --install`:
+the app binary doubles as the cli. homebrew and manual installs can call it directly:
+
+```bash
+/Applications/ICloudGuard.app/Contents/MacOS/ICloudGuard --help
+```
+
+the `icloud-guard` convenience wrapper is installed automatically when you run `./scripts/build-app.sh --install`:
 
 ```bash
 ~/bin/icloud-guard --help
@@ -152,6 +365,8 @@ the cli wrapper is installed automatically when you run `./scripts/build-app.sh 
 add `~/bin` to your `PATH` if it's not already there.
 
 ### subcommands
+
+examples below use the `icloud-guard` wrapper. for homebrew or manual installs, replace `icloud-guard` with `/Applications/ICloudGuard.app/Contents/MacOS/ICloudGuard`.
 
 ```bash
 icloud-guard status          # show icloud drive status
@@ -176,6 +391,7 @@ icloud guard sends local notifications for:
 - pollution threshold crossing (>70%)
 
 notifications appear even when the app is in the foreground. authorize them in system settings → notifications → icloud guard if prompted.
+
 ## acknowledgments
 
 - [howard oakley (eclectic light)](https://eclecticlight.co/) — for documenting the sonoma fileprovider eviction regression and the `com.apple.fileprovider.pinned` xattr mechanism
