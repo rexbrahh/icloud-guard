@@ -11,6 +11,9 @@ jobs:
     runs-on: macos-14
     permissions:
       contents: write
+    env:
+      HAS_MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 != '' }}
+      HAS_NOTARIZATION: ${{ secrets.APPLE_ID != '' && secrets.APPLE_TEAM_ID != '' && secrets.APPLE_APP_SPECIFIC_PASSWORD != '' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -44,6 +47,64 @@ jobs:
         run: |
           plutil -replace CFBundleShortVersionString -string "${{ steps.version.outputs.version }}" .build/ICloudGuard.app/Contents/Info.plist
           plutil -replace CFBundleVersion -string "${{ github.run_number }}" .build/ICloudGuard.app/Contents/Info.plist
+
+      - name: Import Developer ID certificate
+        if: env.HAS_MACOS_CERTIFICATE == 'true'
+        env:
+          MACOS_CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          CERT_PATH="$RUNNER_TEMP/developer-id.p12"
+          KEYCHAIN_PATH="$RUNNER_TEMP/app-signing.keychain-db"
+          echo "$MACOS_CERTIFICATE_P12_BASE64" | base64 --decode > "$CERT_PATH"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security import "$CERT_PATH" -P "$MACOS_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security list-keychains -d user -s "$KEYCHAIN_PATH" login.keychain
+
+      - name: Sign and verify app bundle
+        env:
+          CODESIGN_IDENTITY: ${{ secrets.CODESIGN_IDENTITY }}
+          CODESIGN_REQUIRE_DEVELOPER_ID: ${{ env.HAS_MACOS_CERTIFICATE }}
+        run: |
+          if [ "$CODESIGN_REQUIRE_DEVELOPER_ID" = "true" ]; then
+            if [ -z "$CODESIGN_IDENTITY" ]; then
+              CODESIGN_IDENTITY=$(security find-identity -v -p codesigning | awk -F'"' '/Developer ID Application/ { print $2; exit }')
+            fi
+            if [ -z "$CODESIGN_IDENTITY" ]; then
+              echo "Developer ID certificate was imported, but no Developer ID Application identity was found." >&2
+              exit 1
+            fi
+          else
+            CODESIGN_IDENTITY="-"
+          fi
+          echo "Signing with identity: $CODESIGN_IDENTITY"
+          codesign --sign "$CODESIGN_IDENTITY" --force --deep --options runtime .build/ICloudGuard.app
+          codesign --verify --deep --strict --verbose=2 .build/ICloudGuard.app
+
+      - name: Notarize and staple app bundle
+        if: env.HAS_NOTARIZATION == 'true'
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+        run: |
+          ditto -c -k --keepParent .build/ICloudGuard.app "$RUNNER_TEMP/ICloudGuard-notary.zip"
+          xcrun notarytool submit "$RUNNER_TEMP/ICloudGuard-notary.zip" \
+            --apple-id "$APPLE_ID" \
+            --team-id "$APPLE_TEAM_ID" \
+            --password "$APPLE_APP_SPECIFIC_PASSWORD" \
+            --wait
+          xcrun stapler staple .build/ICloudGuard.app
+          spctl --assess --type execute --verbose=2 .build/ICloudGuard.app
+
+      - name: Assess app bundle without notarization
+        if: env.HAS_NOTARIZATION != 'true'
+        run: |
+          spctl --assess --type execute --verbose=2 .build/ICloudGuard.app || true
 
       - name: Create zip
         run: |
