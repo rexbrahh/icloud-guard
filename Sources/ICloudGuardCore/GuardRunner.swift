@@ -5,70 +5,53 @@ public protocol GuardLogging: AnyObject {
     func log(_ message: String)
 }
 
-public protocol ICloudScanning {
-    func scan(scopePath: String, mode: ScanMode) throws -> ScanResult
-    func selectTargetedCandidates(
-        scopePath: String,
-        reclaimTargetBytes: Int64,
-        protectedPaths: [String]
-    ) throws -> TargetedSelectionResult
-}
-
-public struct EvictionResult: Equatable, Sendable {
-    public let evictedCount: Int
-    public let failedCount: Int
-
-    public init(evictedCount: Int, failedCount: Int) {
-        self.evictedCount = evictedCount
-        self.failedCount = failedCount
-    }
-}
-
-public protocol ICloudEvicting {
-    func evict(items: [ICloudItemSnapshot], dryRun: Bool) throws -> EvictionResult
-}
-
+/// CLI fallback runner — used when the menu bar app is not running and the
+/// CLI cannot reach it over IPC. Shares the exact same engine, policy, and
+/// state files as the app so behavior is identical no matter who executes.
 public final class GuardRunner {
-    private let scannerFactory: () -> ICloudScanning
-    private let evictorFactory: (GuardLogging) -> ICloudEvicting
+    private let engineFactory: (GuardLogging) -> EvictionEngine
 
     public init() {
-        self.scannerFactory = { ICloudScanner() }
-        self.evictorFactory = { logger in PackageAwareEvictor(logger: logger) }
+        self.engineFactory = { logger in EvictionEngine(logger: logger) }
     }
 
-    init(
-        scannerFactory: @escaping () -> ICloudScanning,
-        evictorFactory: @escaping (GuardLogging) -> ICloudEvicting
-    ) {
-        self.scannerFactory = scannerFactory
-        self.evictorFactory = evictorFactory
+    init(engineFactory: @escaping (GuardLogging) -> EvictionEngine) {
+        self.engineFactory = engineFactory
     }
 
     public func run(command: GuardCommand, configPath: String?, dryRun: Bool) throws -> Int32 {
         let resolvedConfigPath = configPath ?? defaultConfigPath()
-        let config = try loadConfig(path: resolvedConfigPath)
-        let logger = Logger(logPath: config.logPath)
-        let stateStore = StateStore(statePath: config.statePath)
+        let configURL = URL(fileURLWithPath: NSString(string: resolvedConfigPath).expandingTildeInPath)
+        let appConfig = ConfigStore(configURL: configURL).loadMigrating()
+        let policy = PolicyMapping.corePolicy(from: appConfig).normalized()
+        let configDir = configURL.deletingLastPathComponent()
+
+        let logger = Logger(logPath: configDir.appendingPathComponent("icloud-guard.log").path)
+        let stateStore = StateStore(statePath: configDir.appendingPathComponent("state.json").path)
+        let lockPath = configDir.appendingPathComponent("run.lock").path
         try sanitizeState(stateStore: stateStore)
 
         switch command {
         case .status:
-            let state = try stateStore.load()
-            logger.log("scan-start command=\(command.rawValue) dryRun=\(dryRun)")
-            let scanStartedAt = Date()
-            let scan = try withWatchdog(timeoutSeconds: statusWatchdogTimeoutSeconds(for: config), logger: logger) {
-                try ICloudScanner().scan(scopePath: config.scopePath, mode: .usageOnly)
-            }
-            logger.log("scan-complete phase=usage local=\(scan.localBytes) free=\(scan.freeBytes) elapsedMs=\(elapsedMilliseconds(since: scanStartedAt))")
-            let decision = PolicyEngine.evaluate(scan: scan, state: state, config: config, now: Date())
-            logger.log("status local=\(scan.localBytes) free=\(scan.freeBytes) decision=\(decision.kind.rawValue) growth=\(decision.growthBytes)")
-            printStatus(scan: scan, decision: decision, state: state, growthWindowMinutes: config.policy.growthWindowMinutes)
-            return 0
+            return try executeStatus(
+                scopePath: appConfig.scope.path,
+                policy: policy,
+                logger: logger,
+                stateStore: stateStore
+            )
         case .run, .panicEvict:
             do {
-                return try withLock(lockPath: config.lockPath, logger: logger, stateStore: stateStore) {
-                    try self.execute(command: command, config: config, dryRun: dryRun, logger: logger, stateStore: stateStore)
+                return try withLock(lockPath: lockPath, logger: logger, stateStore: stateStore) {
+                    try self.executeRemediation(
+                        command: command,
+                        scopePath: appConfig.scope.path,
+                        policy: policy,
+                        batchLimit: appConfig.eviction.batchLimit,
+                        panicLimit: appConfig.eviction.panicLimit,
+                        dryRun: dryRun,
+                        logger: logger,
+                        stateStore: stateStore
+                    )
                 }
             } catch GuardError.lockUnavailable(let message) {
                 logger.log("skip reason=lock-contention command=\(command.rawValue)")
@@ -78,9 +61,49 @@ public final class GuardRunner {
         }
     }
 
-    private func execute(
+    // MARK: - Status
+
+    private func executeStatus(
+        scopePath: String,
+        policy: PolicyConfig,
+        logger: Logger,
+        stateStore: StateStore
+    ) throws -> Int32 {
+        let startedAt = Date()
+        logger.log("scan-start command=status")
+        let stats = try withWatchdog(timeoutSeconds: 900, logger: logger) {
+            try DriveStatsCollector.collect(scopePath: scopePath)
+        }
+        logger.log("scan-complete local=\(stats.materializedBytes) free=\(stats.freeBytes) elapsedMs=\(elapsedMilliseconds(since: startedAt))")
+
+        let state = try stateStore.load()
+        let scan = ScanResult(scopePath: scopePath, freeBytes: stats.freeBytes, localBytes: stats.materializedBytes, items: [])
+        let decision = PolicyEngine.evaluate(scan: scan, state: state, config: config(for: policy), now: Date())
+        logger.log("status local=\(stats.materializedBytes) free=\(stats.freeBytes) decision=\(decision.kind.rawValue) growth=\(decision.growthBytes)")
+
+        print("Scope: \(scopePath)")
+        print("Local iCloud footprint: \(formatBytes(stats.materializedBytes)) (\(stats.materializedFiles) files)")
+        print("Evicted (dataless): \(stats.datalessFiles) files")
+        print("Free space: \(formatBytes(stats.freeBytes))")
+        print("Recent growth (\(policy.growthWindowMinutes)m): \(formatBytes(decision.growthBytes))")
+        print("Next action: \(decision.kind.rawValue) (\(decision.reason))")
+        if let seconds = decision.cooldownRemainingSeconds {
+            print("Cooldown remaining: \(seconds)s")
+        }
+        if let summary = state.lastSummary {
+            print("Last summary: \(summary.action.rawValue) at \(ISO8601DateFormatter().string(from: summary.timestamp))")
+        }
+        return 0
+    }
+
+    // MARK: - Remediation
+
+    private func executeRemediation(
         command: GuardCommand,
-        config: GuardConfig,
+        scopePath: String,
+        policy: PolicyConfig,
+        batchLimit: Int,
+        panicLimit: Int,
         dryRun: Bool,
         logger: Logger,
         stateStore: StateStore
@@ -90,11 +113,11 @@ public final class GuardRunner {
         state.activeLock = ActiveLock(pid: getpid(), startedAt: now)
         try stateStore.save(state)
         logger.log("scan-start command=\(command.rawValue) dryRun=\(dryRun)")
-        let watchdog = RunWatchdog(
-            timeoutSeconds: runWatchdogTimeoutSeconds(for: config),
-            logger: logger
-        )
 
+        // Generous ceiling: fileproviderd churn after a large eviction can
+        // slow the post-run scan dramatically. The watchdog exists to kill
+        // truly hung runs, not to rush healthy ones.
+        let watchdog = RunWatchdog(timeoutSeconds: max(policy.sampleIntervalSeconds * 6, 1800), logger: logger)
         defer {
             watchdog.cancel()
             var clearedState = (try? stateStore.load()) ?? state
@@ -102,100 +125,24 @@ public final class GuardRunner {
             try? stateStore.save(clearedState)
         }
 
-        let scanner = scannerFactory()
-        let evictor = evictorFactory(logger)
-        let usageScanStartedAt = Date()
-        let usageScan = try scanner.scan(scopePath: config.scopePath, mode: .usageOnly)
-        logger.log("scan-complete phase=usage local=\(usageScan.localBytes) free=\(usageScan.freeBytes) elapsedMs=\(elapsedMilliseconds(since: usageScanStartedAt))")
-        state.samples = trimSamples(state.samples + [GuardSample(timestamp: now, localBytes: usageScan.localBytes, freeBytes: usageScan.freeBytes)], now: now)
+        let engine = engineFactory(logger)
 
-        let preliminaryDecision = PolicyEngine.evaluate(
-            scan: usageScan,
+        // Phase 1: usage scan + policy decision
+        let stats = try DriveStatsCollector.collect(scopePath: scopePath)
+        state.samples = trimSamples(
+            state.samples + [GuardSample(timestamp: now, localBytes: stats.materializedBytes, freeBytes: stats.freeBytes)],
+            now: now
+        )
+        let scan = ScanResult(scopePath: scopePath, freeBytes: stats.freeBytes, localBytes: stats.materializedBytes, items: [])
+        let decision = PolicyEngine.evaluate(
+            scan: scan,
             state: state,
-            config: config,
+            config: config(for: policy),
             now: now,
             forcePanic: command == .panicEvict
         )
 
-        let initialScan: ScanResult
-        let decision: GuardDecision
-
-        if preliminaryDecision.kind == .panic {
-            let detailedScanStartedAt = Date()
-            do {
-                initialScan = try scanner.scan(scopePath: config.scopePath, mode: .candidateSelection)
-            } catch {
-                logScanFailure(logger: logger, phase: "candidates", error: error)
-                throw error
-            }
-            logger.log("scan-complete phase=candidates local=\(initialScan.localBytes) free=\(initialScan.freeBytes) items=\(initialScan.items.count) elapsedMs=\(elapsedMilliseconds(since: detailedScanStartedAt))")
-            decision = PolicyEngine.evaluate(
-                scan: initialScan,
-                state: state,
-                config: config,
-                now: now,
-                forcePanic: command == .panicEvict
-            )
-        } else if preliminaryDecision.kind == .targeted {
-            let targetedScanStartedAt = Date()
-            let selection: TargetedSelectionResult
-            do {
-                selection = try scanner.selectTargetedCandidates(
-                    scopePath: config.scopePath,
-                    reclaimTargetBytes: preliminaryDecision.reclaimTargetBytes,
-                    protectedPaths: config.policy.protectedPaths
-                )
-            } catch {
-                logScanFailure(logger: logger, phase: "targeted-candidates", error: error)
-                throw error
-            }
-            let reclaimedBytes = selection.items.reduce(into: Int64(0)) { partialResult, item in
-                partialResult += item.localBytes
-            }
-            logger.log(
-                "scan-complete phase=targeted-candidates target=\(preliminaryDecision.reclaimTargetBytes) " +
-                "inspected=\(selection.inspectedCount) selected=\(selection.items.count) reclaimed=\(reclaimedBytes) " +
-                "elapsedMs=\(elapsedMilliseconds(since: targetedScanStartedAt))"
-            )
-
-            initialScan = usageScan
-            decision = GuardDecision(
-                kind: .targeted,
-                reason: preliminaryDecision.reason,
-                candidates: selection.items,
-                reclaimTargetBytes: preliminaryDecision.reclaimTargetBytes,
-                predictedLocalBytes: max(usageScan.localBytes - reclaimedBytes, 0),
-                predictedFreeBytes: usageScan.freeBytes + reclaimedBytes,
-                cooldownRemainingSeconds: nil,
-                growthBytes: preliminaryDecision.growthBytes
-            )
-        } else {
-            initialScan = usageScan
-            decision = preliminaryDecision
-        }
-
-        if decision.kind == .none || decision.kind == .cooldown {
-            let summary = GuardRunSummary(
-                timestamp: now,
-                action: decision.kind,
-                reason: decision.reason,
-                dryRun: dryRun,
-                candidateCount: decision.candidates.count,
-                evictedCount: 0,
-                failedEvictionCount: 0,
-                reclaimedBytes: 0,
-                remainingLocalBytes: initialScan.localBytes,
-                remainingFreeBytes: initialScan.freeBytes,
-                escalatedToPanic: false
-            )
-            state.lastSummary = summary
-            try stateStore.save(state)
-            logger.log("noop action=\(decision.kind.rawValue) reason=\(decision.reason)")
-            printSummary(scan: initialScan, decision: decision, summary: summary)
-            return 0
-        }
-
-        if decision.candidates.isEmpty {
+        guard decision.kind == .targeted || decision.kind == .panic else {
             let summary = GuardRunSummary(
                 timestamp: now,
                 action: decision.kind,
@@ -205,160 +152,114 @@ public final class GuardRunner {
                 evictedCount: 0,
                 failedEvictionCount: 0,
                 reclaimedBytes: 0,
-                remainingLocalBytes: initialScan.localBytes,
-                remainingFreeBytes: initialScan.freeBytes,
+                remainingLocalBytes: stats.materializedBytes,
+                remainingFreeBytes: stats.freeBytes,
                 escalatedToPanic: false
             )
             state.lastSummary = summary
             try stateStore.save(state)
-            logger.log("noop action=\(decision.kind.rawValue) reason=\(decision.reason) candidates=0")
-            printSummary(scan: initialScan, decision: decision, summary: summary)
+            logger.log("noop action=\(decision.kind.rawValue) reason=\(decision.reason)")
+            printSummary(summary: summary, startingLocal: stats.materializedBytes, startingFree: stats.freeBytes, reason: decision.reason)
             return 0
         }
 
-        if config.notifications.enable {
-            Notifier().notify(
-                title: "iCloud Guard",
-                subtitle: decision.kind == .panic ? "Emergency eviction" : "Targeted trim",
-                body: "\(decision.reason). \(decision.candidates.count) candidate(s), \(formatBytes(decision.reclaimTargetBytes)) potential reclaim."
+        // Phase 2: candidate collection
+        let protected = ProtectedPathsMatcher(patterns: policy.protectedPaths)
+        let candidates = try engine.collectCandidates(scopePath: scopePath, protectedPaths: protected)
+        let candidateBytes = candidates.reduce(into: Int64(0)) { $0 += $1.allocatedBytes }
+        logger.log("candidates count=\(candidates.count) bytes=\(candidateBytes) decision=\(decision.kind.rawValue)")
+
+        if candidates.isEmpty {
+            let summary = GuardRunSummary(
+                timestamp: now,
+                action: decision.kind,
+                reason: decision.reason,
+                dryRun: dryRun,
+                candidateCount: 0,
+                evictedCount: 0,
+                failedEvictionCount: 0,
+                reclaimedBytes: 0,
+                remainingLocalBytes: stats.materializedBytes,
+                remainingFreeBytes: stats.freeBytes,
+                escalatedToPanic: false
             )
+            state.lastSummary = summary
+            try stateStore.save(state)
+            logger.log("noop action=\(decision.kind.rawValue) reason=no-candidates")
+            printSummary(summary: summary, startingLocal: stats.materializedBytes, startingFree: stats.freeBytes, reason: decision.reason)
+            return 0
         }
 
-        var selected = decision.candidates
-        var reclaimedBytes = selected.reduce(into: Int64(0)) { partialResult, item in
-            partialResult += item.localBytes
-        }
-        var evictionResult = dryRun ? EvictionResult(evictedCount: 0, failedCount: 0) : try evictor.evict(items: selected, dryRun: dryRun)
-        var evictedCount = evictionResult.evictedCount
-        var failedEvictionCount = evictionResult.failedCount
-        var escalatedToPanic = false
+        // Phase 3: eviction (or dry-run report)
+        let byteBudget: Int64? = decision.kind == .panic ? nil : decision.reclaimTargetBytes
+        let fileBudget = decision.kind == .panic ? panicLimit : batchLimit
 
-        var finalLocalBytes = decision.predictedLocalBytes
-        var finalFreeBytes = decision.predictedFreeBytes
-
-        if !dryRun {
-            let postScan = try scanner.scan(scopePath: config.scopePath, mode: .usageOnly)
-            finalLocalBytes = postScan.localBytes
-            finalFreeBytes = postScan.freeBytes
-        }
-
-        if decision.kind == .targeted
-            && (finalLocalBytes > config.policy.trimLocalBytes || finalFreeBytes < config.policy.warnFreeBytes)
-        {
-            let panicScanStartedAt = Date()
-            let panicScan: ScanResult
-            do {
-                panicScan = try scanner.scan(scopePath: config.scopePath, mode: .candidateSelection)
-            } catch {
-                logScanFailure(logger: logger, phase: "panic-candidates", error: error)
-                throw error
+        if dryRun {
+            var planned: Int64 = 0
+            var plannedCount = 0
+            for candidate in candidates {
+                if plannedCount >= fileBudget { break }
+                if let byteBudget, planned >= byteBudget { break }
+                planned += candidate.allocatedBytes
+                plannedCount += 1
             }
-            logger.log("scan-complete phase=panic-candidates local=\(panicScan.localBytes) free=\(panicScan.freeBytes) items=\(panicScan.items.count) elapsedMs=\(elapsedMilliseconds(since: panicScanStartedAt))")
-            let panicCandidates = PolicyEngine.panicCandidates(scan: panicScan, config: config.policy)
-                .filter { panicCandidate in
-                    !selected.contains(where: { $0.relativePath == panicCandidate.relativePath })
-                }
-
-            if !panicCandidates.isEmpty {
-                escalatedToPanic = true
-                if config.notifications.enable {
-                    Notifier().notify(
-                        title: "iCloud Guard",
-                        subtitle: "Escalating to panic eviction",
-                        body: "Targeted trim was insufficient. Evicting \(panicCandidates.count) additional item(s)."
-                    )
-                }
-
-                selected += panicCandidates
-                reclaimedBytes += panicCandidates.reduce(into: Int64(0)) { partialResult, item in
-                    partialResult += item.localBytes
-                }
-                if !dryRun {
-                    evictionResult = try evictor.evict(items: panicCandidates, dryRun: dryRun)
-                    evictedCount += evictionResult.evictedCount
-                    failedEvictionCount += evictionResult.failedCount
-                }
-
-                if !dryRun {
-                    let postPanicScan = try scanner.scan(scopePath: config.scopePath, mode: .usageOnly)
-                    finalLocalBytes = postPanicScan.localBytes
-                    finalFreeBytes = postPanicScan.freeBytes
-                } else {
-                    finalLocalBytes = max(initialScan.localBytes - reclaimedBytes, 0)
-                    finalFreeBytes = initialScan.freeBytes + reclaimedBytes
-                }
+            print("Dry run: would evict \(plannedCount) file(s), reclaiming \(formatBytes(planned))")
+            for candidate in candidates.prefix(20) {
+                print("  \(candidate.relativePath) (\(formatBytes(candidate.allocatedBytes)))")
             }
+            if candidates.count > 20 {
+                print("  … and \(candidates.count - 20) more")
+            }
+            return 0
         }
 
-        let finalAction: GuardDecisionKind = escalatedToPanic ? .panic : decision.kind
+        let outcome = engine.evict(candidates: candidates, byteBudget: byteBudget, fileBudget: fileBudget)
+
+        // Feed the shared watchlist so the app re-evicts anything that bounces back.
+        if !outcome.evictedPaths.isEmpty {
+            let watchlist = WatchlistWatcher(logger: logger, protectedPaths: protected, scopePath: scopePath)
+            watchlist.add(paths: outcome.evictedPaths)
+        }
+
+        let postStats = try DriveStatsCollector.collect(scopePath: scopePath)
         let summary = GuardRunSummary(
             timestamp: now,
-            action: finalAction,
+            action: decision.kind,
             reason: decision.reason,
             dryRun: dryRun,
-            candidateCount: selected.count,
-            evictedCount: evictedCount,
-            failedEvictionCount: failedEvictionCount,
-            reclaimedBytes: reclaimedBytes,
-            remainingLocalBytes: finalLocalBytes,
-            remainingFreeBytes: finalFreeBytes,
-            escalatedToPanic: escalatedToPanic
+            candidateCount: candidates.count,
+            evictedCount: outcome.evictedCount,
+            failedEvictionCount: outcome.failedCount,
+            reclaimedBytes: outcome.reclaimedBytes,
+            remainingLocalBytes: postStats.materializedBytes,
+            remainingFreeBytes: postStats.freeBytes,
+            escalatedToPanic: false
         )
-
         state.lastSummary = summary
-        if !dryRun {
-            state.lastRemediationAt = now
-        }
+        state.lastRemediationAt = now
         try stateStore.save(state)
 
-        logger.log("remediation action=\(finalAction.rawValue) reason=\(decision.reason) dryRun=\(dryRun) reclaimed=\(reclaimedBytes) count=\(selected.count) failed=\(failedEvictionCount)")
-        printSummary(scan: initialScan, decision: decision, summary: summary)
-
-        if config.notifications.enable {
-            let verb = dryRun ? "Planned" : "Reclaimed"
-            Notifier().notify(
-                title: "iCloud Guard",
-                subtitle: finalAction == .panic ? "Panic eviction finished" : "Trim finished",
-                body: "\(verb) \(formatBytes(summary.reclaimedBytes)); local iCloud now \(formatBytes(summary.remainingLocalBytes)); free space \(formatBytes(summary.remainingFreeBytes))."
-            )
-        }
-
+        logger.log("remediation action=\(decision.kind.rawValue) reclaimed=\(outcome.reclaimedBytes) evicted=\(outcome.evictedCount) failed=\(outcome.failedCount)")
+        printSummary(summary: summary, startingLocal: stats.materializedBytes, startingFree: stats.freeBytes, reason: decision.reason)
         return 0
     }
 
-    private func loadConfig(path: String) throws -> GuardConfig {
-        let url = URL(fileURLWithPath: NSString(string: path).expandingTildeInPath)
-        let store = ConfigStore(configURL: url)
-        let appConfig = store.load()
-        return mapConfig(appConfig, configURL: url)
+    // MARK: - Plumbing (lock, watchdog, samples)
+
+    private func config(for policy: PolicyConfig) -> GuardConfig {
+        GuardConfig(
+            label: "org.nix-community.home.icloud-guard",
+            logPath: AppPaths.log.path,
+            lockPath: AppPaths.lock.path,
+            scopePath: "",
+            statePath: AppPaths.state.path,
+            notifications: NotificationConfig(enable: false),
+            policy: policy
+        )
     }
 
     private func defaultConfigPath() -> String {
-        return AppPaths.config.path
-    }
-
-    private func mapConfig(_ appConfig: AppConfig, configURL: URL) -> GuardConfig {
-        let dir = configURL.deletingLastPathComponent()
-        return GuardConfig(
-            label: "org.nix-community.home.icloud-guard",
-            logPath: dir.appendingPathComponent("icloud-guard.log").path,
-            lockPath: dir.appendingPathComponent("run.lock").path,
-            scopePath: appConfig.scope.path,
-            statePath: dir.appendingPathComponent("state.json").path,
-            notifications: NotificationConfig(enable: false),
-            policy: PolicyConfig(
-                sampleIntervalSeconds: appConfig.watcher.pollutionCheckIntervalSeconds,
-                targetLocalGiB: appConfig.policy.targetLocalGiB,
-                trimLocalGiB: appConfig.policy.trimLocalGiB,
-                warnFreeGiB: appConfig.policy.warnFreeGiB,
-                remediateFreeGiB: appConfig.policy.remediateFreeGiB,
-                panicFreeGiB: appConfig.policy.panicFreeGiB,
-                growthTriggerGiB: appConfig.policy.growthTriggerGiB,
-                growthWindowMinutes: appConfig.policy.growthWindowMinutes,
-                cooldownMinutes: appConfig.policy.cooldownMinutes,
-                protectedPaths: appConfig.scope.protectedPaths
-            )
-        )
+        AppPaths.config.path
     }
 
     private func withLock<T>(
@@ -469,50 +370,22 @@ public final class GuardRunner {
         return Array(samples.filter { $0.timestamp >= cutoff }.suffix(288))
     }
 
-    private func printStatus(scan: ScanResult, decision: GuardDecision, state: GuardState, growthWindowMinutes: Int) {
-        print("Scope: \(scan.scopePath)")
-        print("Local iCloud footprint: \(formatBytes(scan.localBytes))")
-        print("Free space: \(formatBytes(scan.freeBytes))")
-        print("Recent growth (\(growthWindowMinutes)m): \(formatBytes(decision.growthBytes))")
-        print("Next action: \(decision.kind.rawValue) (\(decision.reason))")
-        if let seconds = decision.cooldownRemainingSeconds {
-            print("Cooldown remaining: \(seconds)s")
-        }
-        if let summary = state.lastSummary {
-            print("Last summary: \(summary.action.rawValue) at \(ISO8601DateFormatter().string(from: summary.timestamp))")
-        }
-    }
-
-    private func printSummary(scan: ScanResult, decision: GuardDecision, summary: GuardRunSummary) {
+    private func printSummary(summary: GuardRunSummary, startingLocal: Int64, startingFree: Int64, reason: String) {
         print("Action: \(summary.action.rawValue)")
-        print("Reason: \(decision.reason)")
+        print("Reason: \(reason)")
         print("Dry run: \(summary.dryRun ? "yes" : "no")")
-        print("Starting local footprint: \(formatBytes(scan.localBytes))")
-        print("Starting free space: \(formatBytes(scan.freeBytes))")
+        print("Starting local footprint: \(formatBytes(startingLocal))")
+        print("Starting free space: \(formatBytes(startingFree))")
         print("Candidates selected: \(summary.candidateCount)")
         print("Evicted count: \(summary.evictedCount)")
         print("Failed evictions: \(summary.failedEvictionCount)")
         print("Reclaimed bytes: \(formatBytes(summary.reclaimedBytes))")
         print("Remaining local footprint: \(formatBytes(summary.remainingLocalBytes))")
         print("Remaining free space: \(formatBytes(summary.remainingFreeBytes))")
-        print("Escalated to panic: \(summary.escalatedToPanic ? "yes" : "no")")
     }
 
     private func elapsedMilliseconds(since startedAt: Date) -> Int {
         Int(Date().timeIntervalSince(startedAt) * 1_000)
-    }
-
-    private func logScanFailure(logger: GuardLogging, phase: String, error: Error) {
-        logger.log("scan-failure phase=\(phase) error=\(error)")
-    }
-
-    private func statusWatchdogTimeoutSeconds(for config: GuardConfig) -> Int {
-        max(config.policy.sampleIntervalSeconds - 60, 120)
-    }
-
-    private func runWatchdogTimeoutSeconds(for config: GuardConfig) -> Int {
-        // Allow one skipped interval if remediation is making forward progress.
-        max(config.policy.sampleIntervalSeconds + 60, 180)
     }
 
     private func withWatchdog<T>(timeoutSeconds: Int, logger: Logger, body: () throws -> T) throws -> T {
@@ -543,7 +416,6 @@ public final class Logger: GuardLogging {
 
         queue.sync {
             ensureHandle()
-            // Check rotation BEFORE writing (matches original behavior)
             if bytesWritten >= maxFileSize {
                 rotate()
             }
@@ -553,7 +425,6 @@ public final class Logger: GuardLogging {
                 try handle.write(contentsOf: data)
                 bytesWritten += Int64(data.count)
             } catch {
-                // Handle may be stale (external rotation) — reopen on next call
                 fileHandle = nil
                 fputs("[icloud-guard] log write failed: \(error)\n", stderr)
             }
@@ -587,7 +458,6 @@ public final class Logger: GuardLogging {
     }
 }
 
-
 private final class RunWatchdog {
     private let workItem: DispatchWorkItem
 
@@ -607,443 +477,5 @@ private final class RunWatchdog {
 
     func cancel() {
         workItem.cancel()
-    }
-}
-
-private final class StateStore {
-    private let stateURL: URL
-
-    init(statePath: String) {
-        self.stateURL = URL(fileURLWithPath: NSString(string: statePath).expandingTildeInPath)
-    }
-
-    func load() throws -> GuardState {
-        guard FileManager.default.fileExists(atPath: stateURL.path) else {
-            return GuardState()
-        }
-
-        let data = try Data(contentsOf: stateURL)
-        let decoder = JSONDecoder()
-        decoder.dateDecodingStrategy = .iso8601
-        return try decoder.decode(GuardState.self, from: data)
-    }
-
-    func save(_ state: GuardState) throws {
-        try FileManager.default.createDirectory(at: stateURL.deletingLastPathComponent(), withIntermediateDirectories: true)
-        let encoder = JSONEncoder()
-        encoder.dateEncodingStrategy = .iso8601
-        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        let data = try encoder.encode(state)
-        try data.write(to: stateURL, options: [.atomic])
-    }
-}
-
-private final class Notifier {
-    func notify(title: String, subtitle: String, body: String) {
-        let script = "display notification \"\(escape(body))\" with title \"\(escape(title))\" subtitle \"\(escape(subtitle))\""
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
-        process.arguments = ["-e", script]
-        try? process.run()
-        process.waitUntilExit()
-    }
-
-    private func escape(_ value: String) -> String {
-        value.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
-    }
-}
-
-final class ICloudScanner: ICloudScanning {
-    private let fileManager = FileManager.default
-    private let targetedRankingKeys: [URLResourceKey] = [
-        .isRegularFileKey,
-        .isDirectoryKey,
-        .isPackageKey,
-        .contentModificationDateKey,
-        .fileAllocatedSizeKey,
-        .totalFileAllocatedSizeKey,
-    ]
-    private let usageOnlyKeys: [URLResourceKey] = [
-        .isRegularFileKey,
-        .isPackageKey,
-        .fileAllocatedSizeKey,
-        .totalFileAllocatedSizeKey,
-    ]
-    private let candidateSelectionKeys: [URLResourceKey] = [
-        .isRegularFileKey,
-        .isPackageKey,
-        .isUbiquitousItemKey,
-        .ubiquitousItemIsUploadedKey,
-        .ubiquitousItemIsUploadingKey,
-        .ubiquitousItemIsDownloadingKey,
-        .ubiquitousItemDownloadingStatusKey,
-        .ubiquitousItemDownloadingErrorKey,
-        .ubiquitousItemUploadingErrorKey,
-        .contentModificationDateKey,
-        .fileAllocatedSizeKey,
-        .totalFileAllocatedSizeKey,
-    ]
-
-    func scan(scopePath: String, mode: ScanMode = .candidateSelection) throws -> ScanResult {
-        let scopeURL = URL(fileURLWithPath: NSString(string: scopePath).expandingTildeInPath, isDirectory: true)
-        let freeBytes = try resolveFreeBytes(scopeURL: scopeURL)
-
-        if mode == .usageOnly {
-            let localBytes = try scanUsageOnly(scopeURL: scopeURL)
-            return ScanResult(scopePath: scopeURL.path, freeBytes: freeBytes, localBytes: localBytes, items: [])
-        }
-
-        let keys = resourceKeys(for: mode)
-
-        guard let enumerator = fileManager.enumerator(
-            at: scopeURL,
-            includingPropertiesForKeys: keys,
-            options: [.skipsHiddenFiles]
-        ) else {
-            throw GuardError.runtime("failed to enumerate \(scopeURL.path)")
-        }
-
-        var items: [ICloudItemSnapshot] = []
-        var localBytes: Int64 = 0
-
-        for case let fileURL as URL in enumerator {
-            let values = try fileURL.resourceValues(forKeys: Set(keys))
-            guard values.isRegularFile == true else {
-                continue
-            }
-
-            let allocatedBytes = Int64(values.totalFileAllocatedSize ?? values.fileAllocatedSize ?? 0)
-            localBytes += allocatedBytes
-
-            guard mode == .candidateSelection else {
-                continue
-            }
-
-            let relativePath = relativePath(from: scopeURL, to: fileURL)
-            let snapshot = ICloudItemSnapshot(
-                relativePath: relativePath,
-                absolutePath: fileURL.path,
-                localBytes: allocatedBytes,
-                isRegularFile: values.isRegularFile ?? false,
-                isPackage: values.isPackage ?? false,
-                isUbiquitous: values.isUbiquitousItem ?? false,
-                isUploaded: values.ubiquitousItemIsUploaded ?? false,
-                isUploading: values.ubiquitousItemIsUploading ?? false,
-                isDownloading: values.ubiquitousItemIsDownloading ?? false,
-                downloadingStatus: values.ubiquitousItemDownloadingStatus?.rawValue,
-                hasDownloadError: values.ubiquitousItemDownloadingError != nil,
-                hasUploadError: values.ubiquitousItemUploadingError != nil,
-                contentModificationDate: values.contentModificationDate
-            )
-
-            items.append(snapshot)
-        }
-
-        return ScanResult(scopePath: scopeURL.path, freeBytes: freeBytes, localBytes: localBytes, items: items)
-    }
-
-    func selectTargetedCandidates(
-        scopePath: String,
-        reclaimTargetBytes: Int64,
-        protectedPaths: [String]
-    ) throws -> TargetedSelectionResult {
-        guard reclaimTargetBytes > 0 else {
-            return TargetedSelectionResult(items: [], inspectedCount: 0)
-        }
-
-        let scopeURL = URL(fileURLWithPath: NSString(string: scopePath).expandingTildeInPath, isDirectory: true)
-        let rankedFiles = try rankFilesForTargetedSelection(scopeURL: scopeURL)
-
-        var items: [ICloudItemSnapshot] = []
-        var reclaimedBytes: Int64 = 0
-        var inspectedCount = 0
-        var selectedPackageRoots: [String] = []
-
-        for rankedFile in rankedFiles {
-            if isInsideSelectedPackage(relativePath: rankedFile.relativePath, selectedPackageRoots: selectedPackageRoots) {
-                continue
-            }
-
-            if isProtected(relativePath: rankedFile.relativePath, protectedPaths: protectedPaths) {
-                continue
-            }
-
-            inspectedCount += 1
-            let snapshot = try snapshotForEvictionEligibility(scopeURL: scopeURL, rankedFile: rankedFile)
-            guard snapshot.isEligibleForEviction(protectedPaths: protectedPaths) else {
-                continue
-            }
-
-            items.append(snapshot)
-            reclaimedBytes += snapshot.localBytes
-            if snapshot.isPackage {
-                selectedPackageRoots.append(snapshot.normalizedRelativePath)
-            }
-
-            if reclaimedBytes >= reclaimTargetBytes {
-                break
-            }
-        }
-
-        return TargetedSelectionResult(items: items, inspectedCount: inspectedCount)
-    }
-
-    private func scanUsageOnly(scopeURL: URL) throws -> Int64 {
-        try scanDirectoryUsage(path: scopeURL.path, isRoot: true)
-    }
-
-    private func scanDirectoryUsage(path: String, isRoot: Bool = false) throws -> Int64 {
-        guard let directory = opendir(path) else {
-            if isRoot {
-                throw GuardError.runtime("failed to enumerate \(path)")
-            }
-            return 0
-        }
-
-        defer {
-            closedir(directory)
-        }
-
-        var localBytes: Int64 = 0
-
-        while let entryPointer = readdir(directory) {
-            let entry = entryPointer.pointee
-            let name = withUnsafePointer(to: entry.d_name) { namePointer in
-                namePointer.withMemoryRebound(to: CChar.self, capacity: Int(entry.d_namlen) + 1) {
-                    String(cString: $0)
-                }
-            }
-
-            if name == "." || name == ".." || name.hasPrefix(".") {
-                continue
-            }
-
-            let childPath = path == "/" ? "/\(name)" : "\(path)/\(name)"
-            var statInfo = stat()
-            let result = childPath.withCString { pathPointer in
-                lstat(pathPointer, &statInfo)
-            }
-
-            guard result == 0 else {
-                continue
-            }
-
-            let fileType = statInfo.st_mode & S_IFMT
-            if fileType == S_IFDIR {
-                localBytes += try scanDirectoryUsage(path: childPath)
-                continue
-            }
-
-            guard fileType == S_IFREG else {
-                continue
-            }
-
-            localBytes += Int64(statInfo.st_blocks) * 512
-        }
-
-        return localBytes
-    }
-
-    private func rankFilesForTargetedSelection(scopeURL: URL) throws -> [RankedFile] {
-        guard let enumerator = fileManager.enumerator(
-            at: scopeURL,
-            includingPropertiesForKeys: targetedRankingKeys,
-            options: [.skipsHiddenFiles]
-        ) else {
-            throw GuardError.runtime("failed to enumerate \(scopeURL.path)")
-        }
-
-        var rankedFiles: [RankedFile] = []
-        let rootPath = scopeURL.standardizedFileURL.path
-        var packageCandidates: [String: RankedFile] = [:]
-
-        for case let fileURL as URL in enumerator {
-            let values = try fileURL.resourceValues(forKeys: Set(targetedRankingKeys))
-            let standardizedPath = fileURL.standardizedFileURL.path
-            let relativePath = relativePath(from: scopeURL, to: fileURL)
-
-            if values.isPackage == true {
-                packageCandidates[standardizedPath] = RankedFile(
-                    url: fileURL,
-                    relativePath: relativePath,
-                    localBytes: 0,
-                    contentModificationDate: values.contentModificationDate
-                )
-            }
-
-            guard values.isRegularFile == true else {
-                continue
-            }
-
-            let localBytes = Int64(values.totalFileAllocatedSize ?? values.fileAllocatedSize ?? 0)
-            let packagePaths = packageCandidatePaths(
-                for: fileURL,
-                rootPath: rootPath,
-                packageCandidates: packageCandidates
-            )
-
-            // Evict package roots as a single unit instead of chipping away at their internals.
-            if packagePaths.isEmpty {
-                rankedFiles.append(
-                    RankedFile(
-                        url: fileURL,
-                        relativePath: relativePath,
-                        localBytes: localBytes,
-                        contentModificationDate: values.contentModificationDate
-                    )
-                )
-            }
-
-            for packagePath in packagePaths {
-                guard var candidate = packageCandidates[packagePath] else {
-                    continue
-                }
-                candidate.localBytes += localBytes
-                packageCandidates[packagePath] = candidate
-            }
-        }
-
-        rankedFiles.append(contentsOf: packageCandidates.values.filter { $0.localBytes > 0 })
-
-        return rankedFiles.sorted {
-            if $0.localBytes == $1.localBytes {
-                let lhsDate = $0.contentModificationDate ?? .distantPast
-                let rhsDate = $1.contentModificationDate ?? .distantPast
-                if lhsDate == rhsDate {
-                    return $0.relativePath < $1.relativePath
-                }
-                return lhsDate < rhsDate
-            }
-
-            return $0.localBytes > $1.localBytes
-        }
-    }
-
-    private func snapshotForEvictionEligibility(scopeURL: URL, rankedFile: RankedFile) throws -> ICloudItemSnapshot {
-        let values = try rankedFile.url.resourceValues(forKeys: Set(candidateSelectionKeys))
-        let allocatedBytes = Int64(values.totalFileAllocatedSize ?? values.fileAllocatedSize ?? Int(rankedFile.localBytes))
-        return ICloudItemSnapshot(
-            relativePath: rankedFile.relativePath,
-            absolutePath: rankedFile.url.path,
-            localBytes: allocatedBytes,
-            isRegularFile: values.isRegularFile ?? true,
-            isPackage: values.isPackage ?? false,
-            isUbiquitous: values.isUbiquitousItem ?? false,
-            isUploaded: values.ubiquitousItemIsUploaded ?? false,
-            isUploading: values.ubiquitousItemIsUploading ?? false,
-            isDownloading: values.ubiquitousItemIsDownloading ?? false,
-            downloadingStatus: values.ubiquitousItemDownloadingStatus?.rawValue,
-            hasDownloadError: values.ubiquitousItemDownloadingError != nil,
-            hasUploadError: values.ubiquitousItemUploadingError != nil,
-            contentModificationDate: values.contentModificationDate ?? rankedFile.contentModificationDate
-        )
-    }
-
-    private func isProtected(relativePath: String, protectedPaths: [String]) -> Bool {
-        let candidate = relativePath.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-
-        for protectedPath in protectedPaths {
-            let normalized = protectedPath.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-            guard !normalized.isEmpty else {
-                continue
-            }
-
-            if candidate == normalized || candidate.hasPrefix(normalized + "/") {
-                return true
-            }
-        }
-
-        return false
-    }
-
-    private func packageCandidatePaths(
-        for fileURL: URL,
-        rootPath: String,
-        packageCandidates: [String: RankedFile]
-    ) -> [String] {
-        var matches: [String] = []
-        var currentURL = fileURL.deletingLastPathComponent().standardizedFileURL
-
-        while true {
-            let currentPath = currentURL.path
-            if packageCandidates[currentPath] != nil {
-                matches.append(currentPath)
-            }
-            if currentPath == rootPath {
-                break
-            }
-
-            let parentURL = currentURL.deletingLastPathComponent().standardizedFileURL
-            if parentURL.path == currentPath {
-                break
-            }
-            currentURL = parentURL
-        }
-
-        return matches
-    }
-
-    private func isInsideSelectedPackage(relativePath: String, selectedPackageRoots: [String]) -> Bool {
-        let candidate = relativePath.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-
-        for selectedPackageRoot in selectedPackageRoots {
-            if candidate == selectedPackageRoot || candidate.hasPrefix(selectedPackageRoot + "/") {
-                return true
-            }
-        }
-
-        return false
-    }
-
-    private func resourceKeys(for mode: ScanMode) -> [URLResourceKey] {
-        switch mode {
-        case .usageOnly:
-            return usageOnlyKeys
-        case .candidateSelection:
-            return candidateSelectionKeys
-        }
-    }
-
-    private func resolveFreeBytes(scopeURL: URL) throws -> Int64 {
-        let values = try scopeURL.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey])
-        if let bytes = values.volumeAvailableCapacityForImportantUsage {
-            return Int64(bytes)
-        }
-
-        let attrs = try fileManager.attributesOfFileSystem(forPath: scopeURL.path)
-        if let freeSize = attrs[.systemFreeSize] as? NSNumber {
-            return freeSize.int64Value
-        }
-
-        throw GuardError.runtime("unable to determine free space for \(scopeURL.path)")
-    }
-
-    private func relativePath(from rootURL: URL, to fileURL: URL) -> String {
-        let rootComponents = rootURL.standardizedFileURL.pathComponents
-        let fileComponents = fileURL.standardizedFileURL.pathComponents
-        let relativeComponents = fileComponents.dropFirst(rootComponents.count)
-        return relativeComponents.joined(separator: "/")
-    }
-}
-
-public enum ScanMode {
-    case usageOnly
-    case candidateSelection
-}
-
-private struct RankedFile {
-    let url: URL
-    let relativePath: String
-    var localBytes: Int64
-    let contentModificationDate: Date?
-}
-
-public struct TargetedSelectionResult {
-    public let items: [ICloudItemSnapshot]
-    public let inspectedCount: Int
-
-    public init(items: [ICloudItemSnapshot], inspectedCount: Int) {
-        self.items = items
-        self.inspectedCount = inspectedCount
     }
 }

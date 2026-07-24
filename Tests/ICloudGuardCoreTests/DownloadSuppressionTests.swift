@@ -99,7 +99,7 @@ final class EvictionVerificationTests: XCTestCase {
         let fileURL = sandbox.appendingPathComponent("test.bin")
         try Data(repeating: 0x41, count: 4096).write(to: fileURL)
 
-        let verification = PackageAwareEvictor.verifyDataless(at: fileURL.path)
+        let verification = DatalessVerifier.verify(at: fileURL.path)
 
         XCTAssertEqual(verification.absolutePath, fileURL.path)
         XCTAssertFalse(verification.isDataless)
@@ -109,7 +109,7 @@ final class EvictionVerificationTests: XCTestCase {
     }
 
     func testVerifyDatalessReturnsZeroForNonexistentFile() {
-        let verification = PackageAwareEvictor.verifyDataless(at: "/nonexistent/path/file.bin")
+        let verification = DatalessVerifier.verify(at: "/nonexistent/path/file.bin")
 
         XCTAssertFalse(verification.isDataless)
         XCTAssertEqual(verification.fileAllocatedSize, 0)
@@ -184,66 +184,71 @@ final class RematerializationEventTests: XCTestCase {
     }
 }
 
-// MARK: - PackageAwareEvictor Tests
+// MARK: - EvictionEngine Tests
 
-final class PackageAwareEvictorTests: XCTestCase {
-    func testDryRunDoesNotEvict() throws {
-        let logger = TestLogger()
-        let evictor = PackageAwareEvictor(logger: logger)
-
-        let item = ICloudItemSnapshot(
-            relativePath: "test.bin",
-            absolutePath: "/tmp/test.bin",
-            localBytes: 1024,
-            isRegularFile: true,
-            isPackage: false,
-            isUbiquitous: true,
-            isUploaded: true,
-            isUploading: false,
-            isDownloading: false,
-            downloadingStatus: URLUbiquitousItemDownloadingStatus.current.rawValue,
-            hasDownloadError: false,
-            hasUploadError: false,
-            contentModificationDate: Date()
-        )
-
-        let result = try evictor.evict(items: [item], dryRun: true)
-        XCTAssertEqual(result.evictedCount, 0)
-        XCTAssertEqual(result.failedCount, 0)
-        XCTAssertTrue(logger.messages.contains(where: { $0.contains("dry-run evict") }))
-    }
-
-    func testEvictRegularFileLogsSuccess() throws {
+final class EvictionEngineTests: XCTestCase {
+    func testEvictNonUbiquitousFileCountsFailureWithReason() throws {
         let sandbox = try makeSandbox()
         let fileURL = sandbox.appendingPathComponent("regular.txt")
         try Data(repeating: 0x42, count: 256).write(to: fileURL)
 
         let logger = TestLogger()
-        let evictor = PackageAwareEvictor(logger: logger)
-
-        let item = ICloudItemSnapshot(
+        let engine = EvictionEngine(logger: logger)
+        let candidate = EvictionCandidate(
+            path: fileURL.path,
             relativePath: "regular.txt",
-            absolutePath: fileURL.path,
-            localBytes: 256,
-            isRegularFile: true,
-            isPackage: false,
-            isUbiquitous: false,
-            isUploaded: true,
-            isUploading: false,
-            isDownloading: false,
-            downloadingStatus: nil,
-            hasDownloadError: false,
-            hasUploadError: false,
-            contentModificationDate: Date()
+            allocatedBytes: 256,
+            modificationDate: Date()
         )
 
-        // This will fail because the file is not ubiquitous, but it tests the path
-        let result = try evictor.evict(items: [item], dryRun: false)
-        // Non-ubiquitous files can't be evicted
-        XCTAssertEqual(result.failedCount, 1)
-        XCTAssertEqual(result.evictedCount, 0)
-        XCTAssertTrue(logger.messages.contains(where: { $0.contains("evict-failed role=file path=regular.txt") }))
-        XCTAssertTrue(logger.messages.contains(where: { $0.contains("allocated=") }))
+        let outcome = engine.evict(candidates: [candidate])
+        // Non-ubiquitous files can't be evicted — failure must be categorized, not silent
+        XCTAssertEqual(outcome.failedCount, 1)
+        XCTAssertEqual(outcome.evictedCount, 0)
+        XCTAssertEqual(outcome.reclaimedBytes, 0)
+        XCTAssertEqual(outcome.failureReasons.values.reduce(0, +), 1)
+        XCTAssertTrue(logger.messages.contains(where: { $0.contains("evict-failed path=regular.txt") }))
+    }
+
+    func testFileBudgetStopsEviction() throws {
+        let sandbox = try makeSandbox()
+        var candidates: [EvictionCandidate] = []
+        for index in 0..<5 {
+            let fileURL = sandbox.appendingPathComponent("file\(index).txt")
+            try Data(repeating: 0x43, count: 128).write(to: fileURL)
+            candidates.append(EvictionCandidate(
+                path: fileURL.path,
+                relativePath: "file\(index).txt",
+                allocatedBytes: 128,
+                modificationDate: Date()
+            ))
+        }
+
+        let engine = EvictionEngine(logger: TestLogger())
+        let outcome = engine.evict(candidates: candidates, fileBudget: 2)
+        XCTAssertEqual(outcome.evictedCount + outcome.failedCount, 2)
+    }
+
+    func testCancellationStopsEviction() throws {
+        let sandbox = try makeSandbox()
+        var candidates: [EvictionCandidate] = []
+        for index in 0..<5 {
+            let fileURL = sandbox.appendingPathComponent("file\(index).txt")
+            try Data(repeating: 0x44, count: 128).write(to: fileURL)
+            candidates.append(EvictionCandidate(
+                path: fileURL.path,
+                relativePath: "file\(index).txt",
+                allocatedBytes: 128,
+                modificationDate: Date()
+            ))
+        }
+
+        let cancellation = EvictionCancellation()
+        cancellation.cancel()
+        let engine = EvictionEngine(logger: TestLogger())
+        let outcome = engine.evict(candidates: candidates, cancellation: cancellation)
+        XCTAssertTrue(outcome.cancelled)
+        XCTAssertEqual(outcome.evictedCount + outcome.failedCount, 0)
     }
 
     private func makeSandbox() throws -> URL {

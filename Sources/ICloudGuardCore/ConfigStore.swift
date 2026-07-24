@@ -83,18 +83,18 @@ public struct AppConfig: Equatable, Sendable {
     }
 
     public struct WatcherConfig: Equatable, Sendable, Codable {
-        public var metadataWatcherEnabled: Bool
         public var backoffMaxSeconds: Int
         public var pollutionCheckIntervalSeconds: Int
+        public var watchlistPollSeconds: Int
 
         public init(
-            metadataWatcherEnabled: Bool = false,
             backoffMaxSeconds: Int = 60,
-            pollutionCheckIntervalSeconds: Int = 300
+            pollutionCheckIntervalSeconds: Int = 300,
+            watchlistPollSeconds: Int = 10
         ) {
-            self.metadataWatcherEnabled = metadataWatcherEnabled
             self.backoffMaxSeconds = backoffMaxSeconds
             self.pollutionCheckIntervalSeconds = pollutionCheckIntervalSeconds
+            self.watchlistPollSeconds = watchlistPollSeconds
         }
     }
 
@@ -119,8 +119,8 @@ public struct AppConfig: Equatable, Sendable {
         public var growthWindowMinutes: Int
 
         public init(
-            targetLocalGiB: Int = 30,
-            trimLocalGiB: Int = 35,
+            targetLocalGiB: Int = 5,
+            trimLocalGiB: Int = 8,
             warnFreeGiB: Int = 80,
             remediateFreeGiB: Int = 50,
             panicFreeGiB: Int = 25,
@@ -175,8 +175,47 @@ public final class ConfigStore {
               let content = try? String(contentsOf: configURL, encoding: .utf8) else {
             return AppConfig()
         }
-        return parseToml(content)
+        return parseToml(content).config
     }
+
+    /// Load the config, and if any known keys are missing from the file (e.g.
+    /// configs written by older versions) or normalization changed effective
+    /// values, persist the completed/normalized config back to disk. This is
+    /// what keeps old installs working as new keys are introduced — a missing
+    /// key must never silently disable a feature.
+    @discardableResult
+    public func loadMigrating() -> AppConfig {
+        guard FileManager.default.fileExists(atPath: configURL.path),
+              let content = try? String(contentsOf: configURL, encoding: .utf8) else {
+            let fresh = AppConfig()
+            try? save(fresh)
+            return fresh
+        }
+
+        let parsed = parseToml(content)
+        let normalized = parsed.config.normalized()
+
+        let missingKnownKey = Self.knownKeys.subtracting(parsed.seenKeys).isEmpty == false
+        let normalizationChangedValues = normalized.policy != parsed.config.policy
+        let hasLegacyKeys = parsed.seenKeys.contains("watcher.metadata_watcher_enabled")
+
+        if missingKnownKey || normalizationChangedValues || hasLegacyKeys {
+            try? save(normalized)
+        }
+
+        return normalized
+    }
+
+    /// Every "section.key" the current version understands.
+    private static let knownKeys: Set<String> = [
+        "suppression.spotlight", "suppression.quicklook", "suppression.materialize_dataless",
+        "eviction.batch_limit", "eviction.panic_limit",
+        "watcher.backoff_max_seconds", "watcher.pollution_check_interval_seconds", "watcher.watchlist_poll_seconds",
+        "scope.path", "scope.protected_paths",
+        "policy.target_local_gib", "policy.trim_local_gib", "policy.warn_free_gib",
+        "policy.remediate_free_gib", "policy.panic_free_gib", "policy.cooldown_minutes",
+        "policy.growth_trigger_gib", "policy.growth_window_minutes",
+    ]
 
     public func save(_ config: AppConfig) throws {
         let dir = configURL.deletingLastPathComponent()
@@ -187,12 +226,13 @@ public final class ConfigStore {
 
     // MARK: - Minimal TOML Parser
 
-    private func parseToml(_ content: String) -> AppConfig {
+    private func parseToml(_ content: String) -> (config: AppConfig, seenKeys: Set<String>) {
         var suppression = AppConfig.SuppressionConfig()
         var eviction = AppConfig.EvictionConfig()
         var watcher = AppConfig.WatcherConfig()
         var scope = AppConfig.ScopeConfig()
         var policy = AppConfig.PolicyConfig()
+        var seenKeys: Set<String> = []
 
         var currentSection = ""
 
@@ -209,6 +249,7 @@ public final class ConfigStore {
             guard parts.count == 2 else { continue }
             let key = parts[0].trimmingCharacters(in: .whitespaces)
             let rawValue = parts[1].trimmingCharacters(in: .whitespaces)
+            seenKeys.insert("\(currentSection).\(key)")
 
             switch currentSection {
             case "suppression":
@@ -226,9 +267,9 @@ public final class ConfigStore {
                 }
             case "watcher":
                 switch key {
-                case "metadata_watcher_enabled": watcher.metadataWatcherEnabled = parseBool(rawValue)
                 case "backoff_max_seconds": watcher.backoffMaxSeconds = parseInt(rawValue) ?? 60
                 case "pollution_check_interval_seconds": watcher.pollutionCheckIntervalSeconds = parseInt(rawValue) ?? 300
+                case "watchlist_poll_seconds": watcher.watchlistPollSeconds = parseInt(rawValue) ?? 10
                 default: break
                 }
             case "scope":
@@ -256,7 +297,7 @@ public final class ConfigStore {
             }
         }
 
-        return AppConfig(suppression: suppression, eviction: eviction, watcher: watcher, scope: scope, policy: policy)
+        return (AppConfig(suppression: suppression, eviction: eviction, watcher: watcher, scope: scope, policy: policy), seenKeys)
     }
 
     private func parseBool(_ value: String) -> Bool {
@@ -294,9 +335,9 @@ public final class ConfigStore {
         lines.append("panic_limit = \(config.eviction.panicLimit)")
         lines.append("")
         lines.append("[watcher]")
-        lines.append("metadata_watcher_enabled = \(config.watcher.metadataWatcherEnabled)")
         lines.append("backoff_max_seconds = \(config.watcher.backoffMaxSeconds)")
         lines.append("pollution_check_interval_seconds = \(config.watcher.pollutionCheckIntervalSeconds)")
+        lines.append("watchlist_poll_seconds = \(config.watcher.watchlistPollSeconds)")
         lines.append("")
         lines.append("[scope]")
         lines.append("path = \"\(config.scope.path)\"")

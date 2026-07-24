@@ -43,6 +43,14 @@ public struct ICloudGuardApp: App {
                             viewModel.reloadConfig()
                         }
                     }
+                    // Route CLI commands (icloud-guard status/evict/panic-evict)
+                    // to the live guard service so CLI and app share one engine.
+                    ipcServer?.commandHandler = { [viewModel] command, dryRun, progress in
+                        await viewModel.executeIPCCommand(command, dryRun: dryRun, progress: progress)
+                    }
+                    // Start guarding at launch — not on first menu-bar click.
+                    viewModel.startGuardService(scopePath: appConfigModel.config.scope.path)
+                    viewModel.refreshPolicyCache()
                 }
         }
             .windowResizability(.contentSize)

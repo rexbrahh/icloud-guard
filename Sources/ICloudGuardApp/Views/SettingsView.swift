@@ -59,8 +59,9 @@ private struct GeneralSettingsView: View {
                         .toggleStyle(.switch)
                     Toggle("Non-materializing I/O policy", isOn: Binding(get: { configModel.config.suppression.nonMaterializingIOPolicyEnabled }, set: { configModel.updateSuppression(.init(spotlight: configModel.config.suppression.spotlight, quicklook: configModel.config.suppression.quicklook, materializeDataless: !$0)) }))
                         .toggleStyle(.switch)
-                    Toggle("Metadata rematerialization watcher", isOn: Binding(get: { configModel.config.watcher.metadataWatcherEnabled }, set: { configModel.updateWatcher(.init(metadataWatcherEnabled: $0, backoffMaxSeconds: configModel.config.watcher.backoffMaxSeconds, pollutionCheckIntervalSeconds: configModel.config.watcher.pollutionCheckIntervalSeconds)) }))
-                        .toggleStyle(.switch)
+                    Text("Rematerialization defense is always on: recently evicted files are watched and re-evicted if iCloud downloads them again.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                 }
 
                 Divider()
@@ -69,25 +70,25 @@ private struct GeneralSettingsView: View {
                     Text("Active Defense")
                         .font(.headline)
                     HStack {
-                        Label("Watcher", systemImage: viewModel.watcherActive ? "eye.fill" : "eye.slash")
+                        Label("Watchlist", systemImage: "eye.fill")
                             .foregroundStyle(.secondary)
                         Spacer()
-                        Text(viewModel.watcherActive ? "Active" : "Inactive")
+                        Text("\(viewModel.status.watchlistCount) path(s)")
                             .foregroundStyle(.secondary)
                     }
                     HStack {
-                        Label("Suppression", systemImage: viewModel.suppressionActive ? "checkmark.circle.fill" : "circle")
+                        Label("Suppression", systemImage: viewModel.status.suppressionActive ? "checkmark.circle.fill" : "circle")
                             .foregroundStyle(.secondary)
                         Spacer()
-                        Text(viewModel.suppressionActive ? "Active" : "Inactive")
+                        Text(viewModel.status.suppressionActive ? "Active" : "Inactive")
                             .foregroundStyle(.secondary)
                     }
-                    if viewModel.rematerializationCount > 0 {
+                    if viewModel.status.rematerializedTotal > 0 {
                         HStack {
                             Label("Re-evictions", systemImage: "arrow.2.circlepath")
                                 .foregroundStyle(.secondary)
                             Spacer()
-                            Text("\(viewModel.rematerializationCount)")
+                            Text("\(viewModel.status.rematerializedTotal)")
                                 .monospacedDigit()
                                 .foregroundStyle(.secondary)
                         }
@@ -110,14 +111,30 @@ private struct PolicySettingsView: View {
         configModel.updateScope(.init(path: configModel.config.scope.path, protectedPaths: paths))
     }
 
+    /// Write a policy while preserving the trim > target invariant in the UI
+    /// itself, so what you see is what the engine enforces.
+    @MainActor private func savePolicy(_ mutate: (inout AppConfig.PolicyConfig) -> Void) {
+        var policy = configModel.config.policy
+        mutate(&policy)
+        policy.targetLocalGiB = max(policy.targetLocalGiB, 1)
+        policy.trimLocalGiB = max(policy.trimLocalGiB, policy.targetLocalGiB + 1)
+        policy.panicFreeGiB = max(policy.panicFreeGiB, 1)
+        policy.remediateFreeGiB = max(policy.remediateFreeGiB, policy.panicFreeGiB)
+        policy.warnFreeGiB = max(policy.warnFreeGiB, policy.remediateFreeGiB)
+        configModel.updatePolicy(policy)
+    }
+
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
                 Group {
                     Text("Local iCloud Thresholds")
                         .font(.headline)
-                    Stepper("Target local: \(configModel.config.policy.targetLocalGiB) GiB", value: Binding(get: { configModel.config.policy.targetLocalGiB }, set: { configModel.updatePolicy(.init(targetLocalGiB: $0, trimLocalGiB: configModel.config.policy.trimLocalGiB, warnFreeGiB: configModel.config.policy.warnFreeGiB, remediateFreeGiB: configModel.config.policy.remediateFreeGiB, panicFreeGiB: configModel.config.policy.panicFreeGiB, cooldownMinutes: configModel.config.policy.cooldownMinutes, growthTriggerGiB: configModel.config.policy.growthTriggerGiB, growthWindowMinutes: configModel.config.policy.growthWindowMinutes)) }), in: 1...200)
-                    Stepper("Trim trigger: \(configModel.config.policy.trimLocalGiB) GiB", value: Binding(get: { configModel.config.policy.trimLocalGiB }, set: { configModel.updatePolicy(.init(targetLocalGiB: configModel.config.policy.targetLocalGiB, trimLocalGiB: $0, warnFreeGiB: configModel.config.policy.warnFreeGiB, remediateFreeGiB: configModel.config.policy.remediateFreeGiB, panicFreeGiB: configModel.config.policy.panicFreeGiB, cooldownMinutes: configModel.config.policy.cooldownMinutes, growthTriggerGiB: configModel.config.policy.growthTriggerGiB, growthWindowMinutes: configModel.config.policy.growthWindowMinutes)) }), in: 1...300)
+                    Stepper("Target local: \(configModel.config.policy.targetLocalGiB) GiB", value: Binding(get: { configModel.config.policy.targetLocalGiB }, set: { newValue in savePolicy { $0.targetLocalGiB = newValue } }), in: 1...200)
+                    Stepper("Trim trigger: \(configModel.config.policy.trimLocalGiB) GiB", value: Binding(get: { configModel.config.policy.trimLocalGiB }, set: { newValue in savePolicy { $0.trimLocalGiB = newValue } }), in: 1...300)
+                    Text("When local iCloud copies exceed the trim trigger, the largest/oldest files are evicted (local copies only) until the footprint is back at the target.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                 }
 
                 Divider()
@@ -125,9 +142,9 @@ private struct PolicySettingsView: View {
                 Group {
                     Text("Free Space Thresholds")
                         .font(.headline)
-                    Stepper("Warn at: \(configModel.config.policy.warnFreeGiB) GiB free", value: Binding(get: { configModel.config.policy.warnFreeGiB }, set: { configModel.updatePolicy(.init(targetLocalGiB: configModel.config.policy.targetLocalGiB, trimLocalGiB: configModel.config.policy.trimLocalGiB, warnFreeGiB: $0, remediateFreeGiB: configModel.config.policy.remediateFreeGiB, panicFreeGiB: configModel.config.policy.panicFreeGiB, cooldownMinutes: configModel.config.policy.cooldownMinutes, growthTriggerGiB: configModel.config.policy.growthTriggerGiB, growthWindowMinutes: configModel.config.policy.growthWindowMinutes)) }), in: 10...500)
-                    Stepper("Remediate at: \(configModel.config.policy.remediateFreeGiB) GiB free", value: Binding(get: { configModel.config.policy.remediateFreeGiB }, set: { configModel.updatePolicy(.init(targetLocalGiB: configModel.config.policy.targetLocalGiB, trimLocalGiB: configModel.config.policy.trimLocalGiB, warnFreeGiB: configModel.config.policy.warnFreeGiB, remediateFreeGiB: $0, panicFreeGiB: configModel.config.policy.panicFreeGiB, cooldownMinutes: configModel.config.policy.cooldownMinutes, growthTriggerGiB: configModel.config.policy.growthTriggerGiB, growthWindowMinutes: configModel.config.policy.growthWindowMinutes)) }), in: 10...500)
-                    Stepper("Panic at: \(configModel.config.policy.panicFreeGiB) GiB free", value: Binding(get: { configModel.config.policy.panicFreeGiB }, set: { configModel.updatePolicy(.init(targetLocalGiB: configModel.config.policy.targetLocalGiB, trimLocalGiB: configModel.config.policy.trimLocalGiB, warnFreeGiB: configModel.config.policy.warnFreeGiB, remediateFreeGiB: configModel.config.policy.remediateFreeGiB, panicFreeGiB: $0, cooldownMinutes: configModel.config.policy.cooldownMinutes, growthTriggerGiB: configModel.config.policy.growthTriggerGiB, growthWindowMinutes: configModel.config.policy.growthWindowMinutes)) }), in: 5...500)
+                    Stepper("Warn at: \(configModel.config.policy.warnFreeGiB) GiB free", value: Binding(get: { configModel.config.policy.warnFreeGiB }, set: { newValue in savePolicy { $0.warnFreeGiB = newValue } }), in: 10...500)
+                    Stepper("Remediate at: \(configModel.config.policy.remediateFreeGiB) GiB free", value: Binding(get: { configModel.config.policy.remediateFreeGiB }, set: { newValue in savePolicy { $0.remediateFreeGiB = newValue } }), in: 10...500)
+                    Stepper("Panic at: \(configModel.config.policy.panicFreeGiB) GiB free", value: Binding(get: { configModel.config.policy.panicFreeGiB }, set: { newValue in savePolicy { $0.panicFreeGiB = newValue } }), in: 5...500)
                 }
 
                 Divider()
@@ -144,9 +161,10 @@ private struct PolicySettingsView: View {
                 Group {
                     Text("Timing")
                         .font(.headline)
-                    Stepper("Cooldown: \(configModel.config.policy.cooldownMinutes)min", value: Binding(get: { configModel.config.policy.cooldownMinutes }, set: { configModel.updatePolicy(.init(targetLocalGiB: configModel.config.policy.targetLocalGiB, trimLocalGiB: configModel.config.policy.trimLocalGiB, warnFreeGiB: configModel.config.policy.warnFreeGiB, remediateFreeGiB: configModel.config.policy.remediateFreeGiB, panicFreeGiB: configModel.config.policy.panicFreeGiB, cooldownMinutes: $0, growthTriggerGiB: configModel.config.policy.growthTriggerGiB, growthWindowMinutes: configModel.config.policy.growthWindowMinutes)) }), in: 1...120)
-                    Stepper("Pollution check: \(configModel.config.watcher.pollutionCheckIntervalSeconds)s", value: Binding(get: { configModel.config.watcher.pollutionCheckIntervalSeconds }, set: { configModel.updateWatcher(.init(metadataWatcherEnabled: configModel.config.watcher.metadataWatcherEnabled, backoffMaxSeconds: configModel.config.watcher.backoffMaxSeconds, pollutionCheckIntervalSeconds: $0)) }), in: 60...3600, step: 60)
-                    Stepper("Watcher backoff max: \(configModel.config.watcher.backoffMaxSeconds)s", value: Binding(get: { configModel.config.watcher.backoffMaxSeconds }, set: { configModel.updateWatcher(.init(metadataWatcherEnabled: configModel.config.watcher.metadataWatcherEnabled, backoffMaxSeconds: $0, pollutionCheckIntervalSeconds: configModel.config.watcher.pollutionCheckIntervalSeconds)) }), in: 10...300, step: 10)
+                    Stepper("Cooldown: \(configModel.config.policy.cooldownMinutes)min", value: Binding(get: { configModel.config.policy.cooldownMinutes }, set: { newValue in savePolicy { $0.cooldownMinutes = newValue } }), in: 1...120)
+                    Stepper("Scan interval: \(configModel.config.watcher.pollutionCheckIntervalSeconds)s", value: Binding(get: { configModel.config.watcher.pollutionCheckIntervalSeconds }, set: { configModel.updateWatcher(.init(backoffMaxSeconds: configModel.config.watcher.backoffMaxSeconds, pollutionCheckIntervalSeconds: $0, watchlistPollSeconds: configModel.config.watcher.watchlistPollSeconds)) }), in: 60...3600, step: 60)
+                    Stepper("Watchlist poll: \(configModel.config.watcher.watchlistPollSeconds)s", value: Binding(get: { configModel.config.watcher.watchlistPollSeconds }, set: { configModel.updateWatcher(.init(backoffMaxSeconds: configModel.config.watcher.backoffMaxSeconds, pollutionCheckIntervalSeconds: configModel.config.watcher.pollutionCheckIntervalSeconds, watchlistPollSeconds: $0)) }), in: 5...300, step: 5)
+                    Stepper("Re-evict backoff max: \(configModel.config.watcher.backoffMaxSeconds)s", value: Binding(get: { configModel.config.watcher.backoffMaxSeconds }, set: { configModel.updateWatcher(.init(backoffMaxSeconds: $0, pollutionCheckIntervalSeconds: configModel.config.watcher.pollutionCheckIntervalSeconds, watchlistPollSeconds: configModel.config.watcher.watchlistPollSeconds)) }), in: 10...300, step: 10)
                 }
 
                 Divider()

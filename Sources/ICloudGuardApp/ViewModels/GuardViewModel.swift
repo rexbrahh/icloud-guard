@@ -2,32 +2,52 @@ import Combine
 import SwiftUI
 import ICloudGuardCore
 
+/// The complete, atomically-updated menu bar status. One @Published struct
+/// means one view invalidation per update instead of a storm of them.
+struct GuardStatus: Equatable {
+    var isPaused = false
+    var suppressionActive = false
+    var watchlistCount = 0
+    var rematerializedTotal = 0
+    var lastRematerializedPath: String?
+
+    // Drive statistics (regular files only, full-drive)
+    var materializedFiles = 0
+    var datalessFiles = 0
+    var materializedBytes: Int64 = 0
+    var freeBytes: Int64 = 0
+    var topFolders: [FolderUsage] = []
+    var hasStats = false
+
+    // Active run
+    var activeRunKind: GuardRunKind?
+    var progress: EvictionProgress?
+
+    // Last completed run
+    var lastReport: GuardRunReport?
+
+    // Lifetime
+    var lifetimeEvictedCount = 0
+    var lifetimeReclaimedBytes: Int64 = 0
+
+    var lastError: String?
+
+    var isRunning: Bool { activeRunKind != nil }
+
+    var materializedRatio: Double {
+        let total = materializedFiles + datalessFiles
+        return total > 0 ? Double(materializedFiles) / Double(total) : 0
+    }
+}
+
 @MainActor
 final class GuardViewModel: ObservableObject {
-    @Published var suppressionActive = false
-    @Published var watcherActive = false
-    @Published var rematerializationCount = 0
-    @Published var lastRematerializationPath: String?
-    @Published var lastRematerializationTime: Date?
-    @Published var isEvicting = false
-    @Published var isPaused = false
-    @Published var lastError: String?
-
-    // Pollution metrics
-    @Published var materializedCount = 0
-    @Published var datalessCount = 0
-    @Published var pollutionRatio: Double = 0
-    @Published var freeSpaceBytes: Int64 = 0
-
-    // Lifetime stats
-    @Published var lifetimeEvictedCount: Int = 0
-    @Published var lifetimeReclaimedBytes: Int64 = 0
-
-    // Top folders by local space
-    @Published var topFolders: [(name: String, bytes: Int64)] = []
+    @Published private(set) var status = GuardStatus()
 
     private var guardService: GuardService?
     private var evictObserver: NSObjectProtocol?
+    private var targetLocalBytes: Int64 = 5 * 1024 * 1024 * 1024
+    private var panicFreeBytes: Int64 = 25 * 1024 * 1024 * 1024
 
     init() {
         loadLifetimeStats()
@@ -36,7 +56,7 @@ final class GuardViewModel: ObservableObject {
             object: nil,
             queue: .main
         ) { [weak self] _ in
-            Task { @MainActor [weak self] in self?.runEviction() }
+            Task { @MainActor [weak self] in self?.trimNow() }
         }
     }
 
@@ -45,74 +65,80 @@ final class GuardViewModel: ObservableObject {
             NotificationCenter.default.removeObserver(observer)
         }
     }
-    // MARK: - Status
+
+    // MARK: - Derived presentation state
 
     var statusIcon: String {
-        if isPaused { return "icloud.slash" }
-        if isEvicting { return "arrow.2.circlepath" }
-        if let err = lastError, !err.isEmpty { return "exclamationmark.icloud.fill" }
+        if status.isPaused { return "icloud.slash" }
+        if status.isRunning { return "arrow.2.circlepath" }
+        if status.lastError != nil { return "exclamationmark.icloud.fill" }
         if isCriticalDisk { return "exclamationmark.icloud.fill" }
-        if pollutionRatio > 0.7 { return "icloud.fill" }
-        if pollutionRatio > 0.3 { return "icloud.and.arrow.down" }
-        if rematerializationCount > 0 { return "icloud.and.arrow.up" }
+        if status.materializedBytes > targetLocalBytes { return "icloud.and.arrow.down" }
         return "icloud"
     }
 
     var statusIconColor: Color {
-        if isPaused { return .secondary }
-        if isEvicting { return .primary }
-        if let err = lastError, !err.isEmpty { return .red }
+        if status.isPaused { return .secondary }
+        if status.lastError != nil { return .red }
         if isCriticalDisk { return .red }
-        if pollutionRatio > 0.7 { return .orange }
+        if status.materializedBytes > targetLocalBytes { return .orange }
         return .primary
     }
 
     var isCriticalDisk: Bool {
-        let freeGiB = Double(freeSpaceBytes) / (1024 * 1024 * 1024)
-        return freeGiB > 0 && freeGiB < 25
+        status.freeBytes > 0 && status.freeBytes < panicFreeBytes
     }
 
     var statusText: String {
-        if isPaused { return "Paused" }
-        if isEvicting { return "Evicting…" }
-        if let err = lastError, !err.isEmpty { return "Error" }
-        if !suppressionActive && !watcherActive { return "Inactive" }
-        if watcherActive && suppressionActive { return "Guarding" }
-        if suppressionActive { return "Suppressed" }
-        if watcherActive { return "Watching" }
-        return "Idle"
-    }
-
-    var pollutionLabel: String {
-        if materializedCount == 0 && datalessCount == 0 { return "—" }
-        let pct = Int(pollutionRatio * 100)
-        return "\(materializedCount) materialized / \(datalessCount) evicted (\(pct)% polluted)"
-    }
-
-    var freeSpaceLabel: String {
-        Self.byteFormatter.string(fromByteCount: freeSpaceBytes)
+        if status.isPaused { return "Paused" }
+        if let kind = status.activeRunKind {
+            switch kind {
+            case .trim: return "Trimming…"
+            case .panic: return "Panic evicting…"
+            case .folder: return "Evicting folder…"
+            case .preview: return "Previewing…"
+            }
+        }
+        if status.lastError != nil { return "Error" }
+        if !status.suppressionActive { return "Starting…" }
+        return "Guarding"
     }
 
     private static let byteFormatter: ByteCountFormatter = {
-        let f = ByteCountFormatter()
-        f.allowedUnits = [.useGB, .useMB]
-        f.countStyle = .file
-        return f
+        let formatter = ByteCountFormatter()
+        formatter.allowedUnits = [.useGB, .useMB]
+        formatter.countStyle = .binary
+        return formatter
     }()
 
-    var lifetimeLabel: String {
-        let reclaimed = Self.lifetimeFormatter.string(fromByteCount: lifetimeReclaimedBytes)
-        return "\(lifetimeEvictedCount) files, \(reclaimed) reclaimed"
+    func formatBytes(_ bytes: Int64) -> String {
+        Self.byteFormatter.string(fromByteCount: bytes)
     }
 
-    private static let lifetimeFormatter: ByteCountFormatter = {
-        let f = ByteCountFormatter()
-        f.allowedUnits = [.useGB, .useMB, .useKB]
-        f.countStyle = .file
-        return f
-    }()
+    var footprintLabel: String {
+        guard status.hasStats else { return "Scanning…" }
+        return "\(formatBytes(status.materializedBytes)) local · target \(formatBytes(targetLocalBytes))"
+    }
 
-    // MARK: - Service
+    var freeSpaceLabel: String {
+        guard status.freeBytes > 0 else { return "" }
+        return "\(formatBytes(status.freeBytes)) free"
+    }
+
+    var pollutionLabel: String {
+        guard status.hasStats else { return "" }
+        return "\(status.materializedFiles) materialized · \(status.datalessFiles) evicted"
+    }
+
+    var lifetimeLabel: String {
+        "\(status.lifetimeEvictedCount) files · \(formatBytes(status.lifetimeReclaimedBytes)) reclaimed"
+    }
+
+    var isUnderTarget: Bool {
+        status.hasStats && status.materializedBytes <= targetLocalBytes
+    }
+
+    // MARK: - Service lifecycle
 
     func startGuardService(scopePath: String) {
         guard guardService == nil else { return }
@@ -129,98 +155,163 @@ final class GuardViewModel: ObservableObject {
 
     func reloadConfig() {
         Task { await guardService?.reloadConfig() }
+        refreshPolicyCache()
     }
+
+    func refreshPolicyCache() {
+        let config = ConfigStore().load()
+        targetLocalBytes = Int64(config.policy.targetLocalGiB) * 1024 * 1024 * 1024
+        panicFreeBytes = Int64(config.policy.panicFreeGiB) * 1024 * 1024 * 1024
+    }
+
+    // MARK: - Events → status
 
     private func handleServiceEvent(_ event: GuardServiceEvent) {
         switch event {
-        case .suppressionApplied:
-            suppressionActive = true
-        case .watcherStarted:
-            watcherActive = true
-        case .watcherStopped:
-            watcherActive = false
-        case .rematerializationBatchDetected(let events):
-            rematerializationCount += events.count
-            if let last = events.last {
-                lastRematerializationPath = last.itemPath
-                lastRematerializationTime = last.detectedAt
+        case .statsUpdated(let stats):
+            status.materializedFiles = stats.materializedFiles
+            status.datalessFiles = stats.datalessFiles
+            status.materializedBytes = stats.materializedBytes
+            status.freeBytes = stats.freeBytes
+            status.topFolders = stats.topFolders
+            status.hasStats = true
+            status.lastError = nil
+
+        case .progress(let progress):
+            status.progress = progress
+
+        case .runStarted(let kind):
+            status.activeRunKind = kind
+            status.progress = nil
+            status.lastError = nil
+
+        case .runFinished(let report):
+            status.activeRunKind = nil
+            status.progress = nil
+            status.lastReport = report
+            if report.evictedCount > 0 || report.reclaimedBytes > 0 {
+                status.lifetimeEvictedCount += report.evictedCount
+                status.lifetimeReclaimedBytes += report.reclaimedBytes
+                saveLifetimeStats()
             }
-        case .evictionStarted:
-            isEvicting = true
-        case .evictionCompleted:
-            isEvicting = false
+
+        case .suppressionApplied(let active):
+            status.suppressionActive = active
+
+        case .watchlistUpdated(let count):
+            status.watchlistCount = count
+
+        case .rematerialized(let paths):
+            status.rematerializedTotal += paths.count
+            status.lastRematerializedPath = paths.last
+
+        case .pausedChanged(let paused):
+            status.isPaused = paused
+
         case .error(let message):
-            lastError = message
-            isEvicting = false
-        case .pollutionUpdated(let materialized, let dataless, let freeSpace, let folders):
-            materializedCount = materialized
-            datalessCount = dataless
-            freeSpaceBytes = freeSpace
-            let total = materialized + dataless
-            pollutionRatio = total > 0 ? Double(materialized) / Double(total) : 0
-            topFolders = folders
-        case .evictionResult(let evicted, let reclaimed):
-            lifetimeEvictedCount += evicted
-            lifetimeReclaimedBytes += reclaimed
-            saveLifetimeStats()
+            status.lastError = message
+            status.activeRunKind = nil
+            status.progress = nil
         }
     }
 
-    func runEviction() {
-        Task { await guardService?.runEviction() }
+    // MARK: - Actions
+
+    func trimNow() {
+        Task { await guardService?.trimNow() }
     }
 
     func panicEvict() {
         Task { await guardService?.panicEvict() }
     }
 
-    func previewEviction() {
-        Task { await guardService?.previewEviction() }
+    func preview() {
+        Task { await guardService?.preview() }
     }
 
-    func evictFolder(_ folderPath: String) {
-        Task { await guardService?.evictFolder(folderPath) }
+    func evictFolder(_ folderName: String) {
+        Task { await guardService?.evictFolder(folderName) }
+    }
+
+    func cancelRun() {
+        Task { await guardService?.cancelRun() }
     }
 
     func togglePause() {
-        isPaused.toggle()
-        if isPaused {
-            Task { await guardService?.pause() }
-        } else {
+        if status.isPaused {
             Task { await guardService?.resume() }
+        } else {
+            Task { await guardService?.pause() }
         }
     }
 
-    // MARK: - Lifetime Stats Persistence
+    // MARK: - IPC execution
+
+    /// Executes a CLI command against the running service. Called by IPCServer.
+    func executeIPCCommand(_ command: GuardCommand, dryRun: Bool, progress: @escaping @Sendable (String) -> Void) async -> (output: String, exitCode: Int) {
+        guard let service = guardService else {
+            return ("guard service not running", 1)
+        }
+
+        let progressForward: (EvictionProgress) -> Void = { update in
+            progress("\(update.phase.rawValue): scanned=\(update.scannedFiles) candidates=\(update.candidateCount) evicted=\(update.evictedCount) reclaimed=\(update.reclaimedBytes)")
+        }
+
+        switch command {
+        case .status:
+            let text = await service.statusText()
+            return (text, 0)
+        case .run:
+            if dryRun {
+                let report = await service.preview()
+                return (Self.describe(report: report, formatBytes: formatBytes), 0)
+            }
+            let report = await service.trimNow(progress: progressForward)
+            return (Self.describe(report: report, formatBytes: formatBytes), 0)
+        case .panicEvict:
+            if dryRun {
+                let report = await service.preview()
+                return (Self.describe(report: report, formatBytes: formatBytes), 0)
+            }
+            let report = await service.panicEvict(progress: progressForward)
+            return (Self.describe(report: report, formatBytes: formatBytes), 0)
+        }
+    }
+
+    private static func describe(report: GuardRunReport, formatBytes: (Int64) -> String) -> String {
+        var lines: [String] = []
+        lines.append("Action: \(report.kind.rawValue)")
+        lines.append("Reason: \(report.reason)")
+        if report.kind == .preview {
+            lines.append("Candidates: \(report.candidateCount) file(s), \(formatBytes(report.previewBytes)) reclaimable")
+        } else {
+            lines.append("Candidates: \(report.candidateCount)")
+            lines.append("Evicted: \(report.evictedCount)")
+            lines.append("Failed: \(report.failedCount)")
+            lines.append("Reclaimed (verified): \(formatBytes(report.reclaimedBytes))")
+            if report.cancelled { lines.append("Cancelled: yes") }
+        }
+        return lines.joined(separator: "\n")
+    }
+
+    // MARK: - Lifetime stats persistence
+
+    private var lifetimeURL: URL { AppPaths.homeDir.appendingPathComponent("lifetime.json") }
 
     private func loadLifetimeStats() {
-        let url = AppPaths.homeDir.appendingPathComponent("lifetime.json")
-        guard let data = try? Data(contentsOf: url),
+        guard let data = try? Data(contentsOf: lifetimeURL),
               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
-        lifetimeEvictedCount = json["evictedCount"] as? Int ?? 0
-        lifetimeReclaimedBytes = Int64(json["reclaimedBytes"] as? Int ?? 0)
+        status.lifetimeEvictedCount = json["evictedCount"] as? Int ?? 0
+        status.lifetimeReclaimedBytes = Int64(json["reclaimedBytes"] as? Int ?? 0)
     }
 
     private func saveLifetimeStats() {
-        let url = AppPaths.homeDir.appendingPathComponent("lifetime.json")
         let json: [String: Any] = [
-            "evictedCount": lifetimeEvictedCount,
-            "reclaimedBytes": Int(lifetimeReclaimedBytes),
+            "evictedCount": status.lifetimeEvictedCount,
+            "reclaimedBytes": Int(status.lifetimeReclaimedBytes),
         ]
         if let data = try? JSONSerialization.data(withJSONObject: json, options: [.prettyPrinted]) {
-            try? data.write(to: url, options: [.atomic])
+            try? data.write(to: lifetimeURL, options: [.atomic])
         }
     }
-}
-
-enum GuardServiceEvent {
-    case suppressionApplied
-    case watcherStarted
-    case watcherStopped
-    case rematerializationBatchDetected([RematerializationEvent])
-    case evictionStarted
-    case evictionCompleted
-    case error(String)
-    case pollutionUpdated(materialized: Int, dataless: Int, freeSpace: Int64, folders: [(name: String, bytes: Int64)])
-    case evictionResult(evicted: Int, reclaimed: Int64)
 }

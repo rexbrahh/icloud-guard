@@ -49,8 +49,8 @@ public struct IPCClient {
         var sendTimeout = timeval(tv_sec: 0, tv_usec: 200_000) // 200ms
         Darwin.setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &sendTimeout, socklen_t(MemoryLayout<timeval>.size))
 
-        // Set receive timeout (SO_RCVTIMEO) — 60s for eviction
-        var recvTimeout = timeval(tv_sec: 60, tv_usec: 0)
+        // Set receive timeout (SO_RCVTIMEO) — long: a full scan + trim takes minutes
+        var recvTimeout = timeval(tv_sec: 600, tv_usec: 0)
         Darwin.setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &recvTimeout, socklen_t(MemoryLayout<timeval>.size))
 
         // Connect

@@ -45,7 +45,7 @@ final class GuardRunnerTests: XCTestCase {
         XCTAssertNil(state.lastSummary)
     }
 
-    func testStatusUsesUsageScanOnly() throws {
+    func testStatusScansAndReportsDecision() throws {
         let sandbox = try makeSandbox()
         let runner = GuardRunner()
         let residentFileURL = sandbox.rootURL
@@ -60,11 +60,10 @@ final class GuardRunnerTests: XCTestCase {
 
         let log = try String(contentsOf: sandbox.logURL, encoding: .utf8)
         XCTAssertTrue(log.contains("scan-start command=status"))
-        XCTAssertTrue(log.contains("scan-complete phase=usage"))
-        XCTAssertFalse(log.contains("phase=candidates"))
+        XCTAssertTrue(log.contains("scan-complete local="))
     }
 
-    func testTargetedRunUsesLazyCandidateSelectionPhase() throws {
+    func testDryRunCollectsCandidatesWithoutEvicting() throws {
         let sandbox = try makeSandbox()
         let runner = GuardRunner()
         let residentFileURL = sandbox.rootURL
@@ -82,64 +81,43 @@ final class GuardRunnerTests: XCTestCase {
         XCTAssertEqual(exitCode, 0)
 
         let log = try String(contentsOf: sandbox.logURL, encoding: .utf8)
-        XCTAssertTrue(log.contains("phase=targeted-candidates"))
+        XCTAssertTrue(log.contains("candidates count=1"))
+
+        // Dry run: the file must still be there, untouched.
+        XCTAssertTrue(FileManager.default.fileExists(atPath: residentFileURL.path))
     }
 
-    func testRunLogsProviderRestrictedTargetedSelectionFailure() throws {
+    func testRunThrowsWhenScopeUnreachable() throws {
         let sandbox = try makeSandbox()
+        var config = try loadConfig(from: sandbox.configURL)
+        config.scope.path = sandbox.rootURL.appendingPathComponent("DoesNotExist").path
+        config.policy.targetLocalGiB = 0
+        config.policy.trimLocalGiB = 0
+        try saveConfig(config, to: sandbox.configURL)
+
+        let runner = GuardRunner()
+        XCTAssertThrowsError(try runner.run(command: .run, configPath: sandbox.configURL.path, dryRun: false))
+
+        let state = try loadState(from: sandbox.stateURL)
+        XCTAssertNil(state.activeLock)
+        XCTAssertNil(state.lastSummary)
+    }
+
+    func testRunRecordsFailedEvictionCountWhenProviderRefusesEviction() throws {
+        let sandbox = try makeSandbox()
+        // A sandbox file is not iCloud-ubiquitous, so evictUbiquitousItem
+        // refuses it — exercising real failure accounting end to end.
+        let residentFileURL = sandbox.rootURL
+            .appendingPathComponent("CloudDocs", isDirectory: true)
+            .appendingPathComponent("resident.bin")
+        try Data(repeating: 0x41, count: 4_096).write(to: residentFileURL)
+
         var config = try loadConfig(from: sandbox.configURL)
         config.policy.targetLocalGiB = 0
         config.policy.trimLocalGiB = 0
         try saveConfig(config, to: sandbox.configURL)
 
-        let scanner = MockScanner(
-            usageScans: [
-                ScanResult(scopePath: sandbox.rootURL.appendingPathComponent("CloudDocs").path, freeBytes: 120 * bytesPerGiB, localBytes: 2 * bytesPerGiB, items: [])
-            ],
-            targetedSelections: [
-                .failure(GuardError.runtime("provider access denied while enumerating managed File Provider items"))
-            ]
-        )
-        let runner = GuardRunner(
-            scannerFactory: { scanner },
-            evictorFactory: { logger in MockEvictor(logger: logger, result: EvictionResult(evictedCount: 0, failedCount: 0)) }
-        )
-
-        XCTAssertThrowsError(try runner.run(command: .run, configPath: sandbox.configURL.path, dryRun: false)) { error in
-            XCTAssertEqual(String(describing: error), "provider access denied while enumerating managed File Provider items")
-        }
-
-        let state = try loadState(from: sandbox.stateURL)
-        XCTAssertNil(state.activeLock)
-        XCTAssertNil(state.lastSummary)
-
-        let log = try String(contentsOf: sandbox.logURL, encoding: .utf8)
-        XCTAssertTrue(log.contains("scan-failure phase=targeted-candidates"))
-        XCTAssertTrue(log.contains("provider access denied"))
-    }
-
-    func testRunRecordsFailedEvictionCountWhenProviderRefusesEviction() throws {
-        let sandbox = try makeSandbox()
-        let scopePath = sandbox.rootURL.appendingPathComponent("CloudDocs").path
-        // Override remediateFreeGiB to trigger targeted eviction with mock data (40 GiB free < 50 GiB threshold)
-        var config = try loadConfig(from: sandbox.configURL)
-        config.policy.remediateFreeGiB = 50
-        try saveConfig(config, to: sandbox.configURL)
-        let candidate = snapshot(scopePath: scopePath, relativePath: "Resident.bin", localGiB: 2)
-        let scanner = MockScanner(
-            usageScans: [
-                ScanResult(scopePath: scopePath, freeBytes: 40 * bytesPerGiB, localBytes: 2 * bytesPerGiB, items: []),
-                ScanResult(scopePath: scopePath, freeBytes: 90 * bytesPerGiB, localBytes: 2 * bytesPerGiB, items: [])
-            ],
-            targetedSelections: [
-                .success(TargetedSelectionResult(items: [candidate], inspectedCount: 1))
-            ]
-        )
-        let runner = GuardRunner(
-            scannerFactory: { scanner },
-            evictorFactory: { logger in MockEvictor(logger: logger, result: EvictionResult(evictedCount: 0, failedCount: 1)) }
-        )
-
+        let runner = GuardRunner()
         let exitCode = try runner.run(command: .run, configPath: sandbox.configURL.path, dryRun: false)
         XCTAssertEqual(exitCode, 0)
 
@@ -195,7 +173,7 @@ final class GuardRunnerTests: XCTestCase {
         let appConfig = AppConfig(
             suppression: .init(),
             eviction: .init(batchLimit: 500, panicLimit: 2000),
-            watcher: .init(backoffMaxSeconds: 60, pollutionCheckIntervalSeconds: 300),
+            watcher: .init(backoffMaxSeconds: 60, pollutionCheckIntervalSeconds: 300, watchlistPollSeconds: 10),
             scope: .init(path: scopeURL.path, protectedPaths: []),
             policy: .init(targetLocalGiB: 30, trimLocalGiB: 35, warnFreeGiB: 0, remediateFreeGiB: 0, panicFreeGiB: 0, cooldownMinutes: 30, growthTriggerGiB: 20, growthWindowMinutes: 10)
         )
@@ -225,82 +203,5 @@ final class GuardRunnerTests: XCTestCase {
     private func loadConfig(from url: URL) throws -> AppConfig {
         let store = ConfigStore(configURL: url)
         return store.load()
-    }
-
-    private func snapshot(scopePath: String, relativePath: String, localGiB: Int) -> ICloudItemSnapshot {
-        ICloudItemSnapshot(
-            relativePath: relativePath,
-            absolutePath: "\(scopePath)/\(relativePath)",
-            localBytes: Int64(localGiB) * bytesPerGiB,
-            isRegularFile: true,
-            isPackage: false,
-            isUbiquitous: true,
-            isUploaded: true,
-            isUploading: false,
-            isDownloading: false,
-            downloadingStatus: URLUbiquitousItemDownloadingStatus.current.rawValue,
-            hasDownloadError: false,
-            hasUploadError: false,
-            contentModificationDate: Date(timeIntervalSince1970: 0)
-        )
-    }
-}
-
-private final class MockScanner: ICloudScanning {
-    private var usageScans: [ScanResult]
-    private var candidateScans: [Result<ScanResult, Error>]
-    private var targetedSelections: [Result<TargetedSelectionResult, Error>]
-
-    init(
-        usageScans: [ScanResult] = [],
-        candidateScans: [Result<ScanResult, Error>] = [],
-        targetedSelections: [Result<TargetedSelectionResult, Error>] = []
-    ) {
-        self.usageScans = usageScans
-        self.candidateScans = candidateScans
-        self.targetedSelections = targetedSelections
-    }
-
-    func scan(scopePath: String, mode: ScanMode) throws -> ScanResult {
-        switch mode {
-        case .usageOnly:
-            guard !usageScans.isEmpty else {
-                throw GuardError.runtime("missing mocked usage scan")
-            }
-            return usageScans.removeFirst()
-        case .candidateSelection:
-            guard !candidateScans.isEmpty else {
-                throw GuardError.runtime("missing mocked candidate scan")
-            }
-            return try candidateScans.removeFirst().get()
-        }
-    }
-
-    func selectTargetedCandidates(
-        scopePath: String,
-        reclaimTargetBytes: Int64,
-        protectedPaths: [String]
-    ) throws -> TargetedSelectionResult {
-        guard !targetedSelections.isEmpty else {
-            throw GuardError.runtime("missing mocked targeted selection")
-        }
-        return try targetedSelections.removeFirst().get()
-    }
-}
-
-private struct MockEvictor: ICloudEvicting {
-    private let logger: GuardLogging
-    private let result: EvictionResult
-
-    init(logger: GuardLogging, result: EvictionResult) {
-        self.logger = logger
-        self.result = result
-    }
-
-    func evict(items: [ICloudItemSnapshot], dryRun: Bool) throws -> EvictionResult {
-        if result.failedCount > 0 {
-            logger.log("mock-eviction-refused count=\(result.failedCount)")
-        }
-        return result
     }
 }

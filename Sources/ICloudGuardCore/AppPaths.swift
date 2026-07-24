@@ -41,6 +41,9 @@ public enum AppPaths {
     /// Auth token file for IPC: `~/.icloud-guard/guard.token`
     public static var tokenFile: URL { homeDir.appendingPathComponent("guard.token") }
 
+    /// Rematerialization watchlist: `~/.icloud-guard/watchlist.json`
+    public static var watchlist: URL { homeDir.appendingPathComponent("watchlist.json") }
+
     // MARK: - Directory Management
 
     /// Ensure the home directory exists with 0700 permissions. Call once at startup.

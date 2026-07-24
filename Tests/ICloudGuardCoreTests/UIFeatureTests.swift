@@ -157,7 +157,7 @@ final class UIFeatureTests: XCTestCase {
         XCTAssertEqual(reloaded.policy.warnFreeGiB, 90)
         XCTAssertEqual(reloaded.policy.cooldownMinutes, 7)
         // Untouched fields keep their defaults.
-        XCTAssertEqual(reloaded.policy.trimLocalGiB, defaults.trimLocalGiB)
+        XCTAssertEqual(reloaded.policy.trimLocalGiB, 13) // normalized: target(12) + 1
         XCTAssertEqual(reloaded.policy.remediateFreeGiB, defaults.remediateFreeGiB)
         XCTAssertEqual(reloaded.policy.panicFreeGiB, defaults.panicFreeGiB)
     }

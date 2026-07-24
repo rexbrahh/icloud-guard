@@ -11,9 +11,12 @@ import ICloudGuardCore
 final class IPCServer {
     private var listenFD: Int32 = -1
     private var acceptQueue: DispatchQueue!
-    private let serialQueue: DispatchQueue
     private var isRunning = false
     private let token: String
+
+    /// Executes parsed commands against the live guard service.
+    /// Parameters: command, dryRun, progress-callback. Returns (output, exitCode).
+    var commandHandler: ((GuardCommand, Bool, @escaping @Sendable (String) -> Void) async -> (output: String, exitCode: Int))?
 
     init() throws {
         // Generate or read auth token
@@ -70,13 +73,16 @@ final class IPCServer {
         listenFD = fd
 
         acceptQueue = DispatchQueue(label: "icloud-guard.ipc.accept", qos: .utility)
-        serialQueue = DispatchQueue(label: "icloud-guard.ipc.serial", qos: .utility)
     }
 
     /// Start the accept loop on a background queue.
     func start() {
         guard !isRunning else { return }
         isRunning = true
+
+        // Writes to clients that vanished mid-command must fail harmlessly,
+        // not kill the app.
+        signal(SIGPIPE, SIG_IGN)
 
         // Install signal handlers for clean shutdown
         signal(SIGTERM) { _ in
@@ -110,8 +116,9 @@ final class IPCServer {
             let clientFD = Darwin.accept(listenFD, nil, nil)
             guard clientFD >= 0 else { continue }
 
-            // Dispatch to serial queue to prevent UI→IPC race
-            serialQueue.async { [weak self] in
+            // Each connection gets its own queue — one slow or dead client
+            // must never block the others.
+            DispatchQueue.global(qos: .utility).async { [weak self] in
                 self?.handleConnection(fd: clientFD)
             }
         }
@@ -149,20 +156,44 @@ final class IPCServer {
             return
         }
 
-        // Execute command and send streaming response.
-        // The GUI service is actor-driven and does not yet stream command output over IPC.
-        // Return an explicit error so CLI callers fall back to the real local GuardRunner
-        // instead of reporting a success-shaped no-op.
+        let dryRun = (cmdJson["dry_run"] as? Bool) ?? false
+
+        let command: GuardCommand
         switch cmd {
-        case "status":
-            sendError(fd: fd, message: "GUI IPC status execution is unavailable; falling back to local runner")
-        case "evict":
-            sendError(fd: fd, message: "GUI IPC eviction execution is unavailable; falling back to local runner")
-        case "panic-evict":
-            sendError(fd: fd, message: "GUI IPC panic eviction execution is unavailable; falling back to local runner")
+        case "status": command = .status
+        case "evict": command = .run
+        case "panic-evict": command = .panicEvict
         default:
             sendError(fd: fd, message: "Unknown command: \(cmd)")
+            return
         }
+
+        guard let handler = commandHandler else {
+            sendError(fd: fd, message: "GUI command execution unavailable; fall back to local runner")
+            return
+        }
+
+        // Bridge the async handler into this serial queue with a semaphore.
+        let semaphore = DispatchSemaphore(value: 0)
+        var resultOutput = ""
+        var resultCode = 1
+
+        Task {
+            let result = await handler(command, dryRun, { [weak self] message in
+                self?.sendProgress(fd: fd, message: message)
+            })
+            resultOutput = result.output
+            resultCode = result.exitCode
+            semaphore.signal()
+        }
+
+        // Generous ceiling: a full-drive scan + trim can take minutes.
+        if semaphore.wait(timeout: .now() + .seconds(900)) == .timedOut {
+            sendError(fd: fd, message: "Command timed out")
+            return
+        }
+
+        sendDone(fd: fd, exitCode: resultCode, output: resultOutput)
     }
 
     // MARK: - Socket I/O
@@ -186,21 +217,26 @@ final class IPCServer {
     }
 
     private func sendProgress(fd: Int32, message: String) {
-        let json = "{\"ok\":\"progress\",\"message\":\"\(message)\"}"
+        let json = "{\"ok\":\"progress\",\"message\":\"\(escapeJSON(message))\"}"
         sendLine(fd: fd, json)
     }
 
     private func sendDone(fd: Int32, exitCode: Int, output: String) {
-        let escapedOutput = output.replacingOccurrences(of: "\\", with: "\\\\")
-            .replacingOccurrences(of: "\"", with: "\\\"")
-        let json = "{\"done\":true,\"exit_code\":\(exitCode),\"output\":\"\(escapedOutput)\"}"
+        let json = "{\"done\":true,\"exit_code\":\(exitCode),\"output\":\"\(escapeJSON(output))\"}"
         sendLine(fd: fd, json)
     }
 
     private func sendError(fd: Int32, message: String) {
-        let escapedMessage = message.replacingOccurrences(of: "\\", with: "\\\\")
-            .replacingOccurrences(of: "\"", with: "\\\"")
-        let json = "{\"done\":true,\"exit_code\":1,\"error\":\"\(escapedMessage)\"}"
+        let json = "{\"done\":true,\"exit_code\":1,\"error\":\"\(escapeJSON(message))\"}"
         sendLine(fd: fd, json)
+    }
+
+    private func escapeJSON(_ value: String) -> String {
+        value
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+            .replacingOccurrences(of: "\n", with: "\\n")
+            .replacingOccurrences(of: "\r", with: "\\r")
+            .replacingOccurrences(of: "\t", with: "\\t")
     }
 }

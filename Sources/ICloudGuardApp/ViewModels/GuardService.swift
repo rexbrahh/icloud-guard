@@ -1,34 +1,155 @@
 import Foundation
-import Network
 import ICloudGuardCore
 
+public enum GuardRunKind: String, Sendable {
+    case trim
+    case panic
+    case folder
+    case preview
+}
+
+public struct GuardRunReport: Equatable, Sendable {
+    public var kind: GuardRunKind
+    public var reason: String
+    public var candidateCount: Int
+    public var evictedCount: Int
+    public var failedCount: Int
+    public var reclaimedBytes: Int64
+    public var failureReasons: [String: Int]
+    public var cancelled: Bool
+    /// For preview runs: what would be reclaimed.
+    public var previewBytes: Int64
+
+    public init(
+        kind: GuardRunKind,
+        reason: String,
+        candidateCount: Int = 0,
+        evictedCount: Int = 0,
+        failedCount: Int = 0,
+        reclaimedBytes: Int64 = 0,
+        failureReasons: [String: Int] = [:],
+        cancelled: Bool = false,
+        previewBytes: Int64 = 0
+    ) {
+        self.kind = kind
+        self.reason = reason
+        self.candidateCount = candidateCount
+        self.evictedCount = evictedCount
+        self.failedCount = failedCount
+        self.reclaimedBytes = reclaimedBytes
+        self.failureReasons = failureReasons
+        self.cancelled = cancelled
+        self.previewBytes = previewBytes
+    }
+}
+
+public enum GuardServiceEvent {
+    /// Fresh drive statistics (materialized/dataless counts, bytes, folders, free space).
+    case statsUpdated(DriveStats)
+    /// Live progress during a scan/eviction run.
+    case progress(EvictionProgress)
+    case runStarted(GuardRunKind)
+    case runFinished(GuardRunReport)
+    case suppressionApplied(Bool)
+    case watchlistUpdated(count: Int)
+    case rematerialized(paths: [String])
+    case pausedChanged(Bool)
+    case error(String)
+}
+
+/// The app's always-on guard service: fast scans, policy-driven auto-trim,
+/// watchlist re-eviction, and manual trim/panic/preview/folder actions.
+///
+/// Safety contract: the only mutation ever performed on the iCloud scope is
+/// `evictUbiquitousItem` (local-copy removal; cloud copy retained).
 actor GuardService {
     private let scopePath: String
     private let logger: Logger
     private let evictionLogger: Logger
     private var config: AppConfig
     private let configStore: ConfigStore
+    private let stateStore: StateStore
     private var suppression: DownloadSuppression?
-    private var watcher: RematerializationWatcher?
-    private var pollutionTimer: DispatchSourceTimer?
-    private var networkMonitor: NWPathMonitor?
-    private var networkEvictionDispatched = false
-    private var isPaused = false
-    private var isEvicting = false
+    private var watchlist: WatchlistWatcher?
+    private var scanTimer: DispatchSourceTimer?
     private let eventHandler: (GuardServiceEvent) -> Void
+
+    private var isPaused = false
+    private var isRunning = false
+    private var isScanning = false
+    private var activeCancellation: EvictionCancellation?
+    private var lastStats: DriveStats?
+    private var lastScanAt: Date?
 
     init(scopePath: String, eventHandler: @escaping (GuardServiceEvent) -> Void) {
         AppPaths.ensureHomeDir()
-        AppPaths.seedDefaultConfigIfMissing()
         self.scopePath = scopePath
         self.eventHandler = eventHandler
         self.logger = Logger(logPath: AppPaths.log.path)
         self.evictionLogger = Logger(logPath: AppPaths.evictionLog.path)
         self.configStore = ConfigStore()
-        self.config = configStore.load()
+        self.config = configStore.loadMigrating()
+        self.stateStore = StateStore()
     }
 
+    // MARK: - Lifecycle
+
     func start() {
+        applySuppression(using: config)
+        startWatchlist(using: config)
+        scheduleScanTimer(intervalSeconds: config.watcher.pollutionCheckIntervalSeconds, fireImmediately: true)
+    }
+
+    func stop() {
+        scanTimer?.cancel()
+        scanTimer = nil
+        watchlist?.stop()
+        // NOTE: the Spotlight suppression marker intentionally stays in place.
+        // It only comes down when the user disables suppression in Settings.
+    }
+
+    func pause() {
+        isPaused = true
+        scanTimer?.cancel()
+        scanTimer = nil
+        watchlist?.stop()
+        eventHandler(.pausedChanged(true))
+    }
+
+    func resume() {
+        isPaused = false
+        startWatchlist(using: config)
+        scheduleScanTimer(intervalSeconds: config.watcher.pollutionCheckIntervalSeconds, fireImmediately: true)
+        eventHandler(.pausedChanged(false))
+    }
+
+    func reloadConfig() {
+        let newConfig = configStore.loadMigrating()
+        let oldConfig = config
+        config = newConfig
+
+        if newConfig.suppression != oldConfig.suppression {
+            if oldConfig.suppression.spotlight && !newConfig.suppression.spotlight {
+                suppression?.removeSpotlightSuppression()
+            }
+            applySuppression(using: newConfig)
+        }
+
+        if newConfig.watcher.backoffMaxSeconds != oldConfig.watcher.backoffMaxSeconds
+            || newConfig.watcher.watchlistPollSeconds != oldConfig.watcher.watchlistPollSeconds
+            || newConfig.scope.protectedPaths != oldConfig.scope.protectedPaths {
+            watchlist?.stop()
+            startWatchlist(using: newConfig)
+        }
+
+        if newConfig.watcher.pollutionCheckIntervalSeconds != oldConfig.watcher.pollutionCheckIntervalSeconds {
+            scheduleScanTimer(intervalSeconds: newConfig.watcher.pollutionCheckIntervalSeconds, fireImmediately: false)
+        }
+    }
+
+    // MARK: - Suppression & watchlist
+
+    private func applySuppression(using config: AppConfig) {
         let suppressionConfig = DownloadSuppressionConfig(
             spotlightSuppression: config.suppression.spotlight,
             quickLookCacheClear: config.suppression.quicklook,
@@ -38,454 +159,422 @@ actor GuardService {
         let supp = DownloadSuppression(config: suppressionConfig, logger: logger)
         supp.apply()
         suppression = supp
-        eventHandler(.suppressionApplied)
-
-        startRematerializationWatcherIfEnabled(using: config)
-
-        startNetworkMonitor()
-        schedulePollutionCheck()
+        eventHandler(.suppressionApplied(true))
     }
 
-    func stop() {
-        pollutionTimer?.cancel()
-        pollutionTimer = nil
-        networkMonitor?.cancel()
-        networkMonitor = nil
-        stopRematerializationWatcher()
-        suppression?.removeSpotlightSuppression()
-        suppression = nil
-        eventHandler(.watcherStopped)
-    }
-
-    func pause() {
-        isPaused = true
-        isEvicting = false
-        pollutionTimer?.cancel()
-        pollutionTimer = nil
-        networkMonitor?.cancel()
-        networkMonitor = nil
-        stopRematerializationWatcher()
-        eventHandler(.watcherStopped)
-    }
-
-    func resume() {
-        isPaused = false
-        isEvicting = false
-        startRematerializationWatcherIfEnabled(using: config)
-        startNetworkMonitor()
-        schedulePollutionCheck()
-    }
-
-    func reloadConfig() {
-        let newConfig = configStore.load()
-        let oldConfig = config
-
-        if newConfig.suppression != oldConfig.suppression {
-            suppression?.removeSpotlightSuppression()
-            let suppressionConfig = DownloadSuppressionConfig(
-                spotlightSuppression: newConfig.suppression.spotlight,
-                quickLookCacheClear: newConfig.suppression.quicklook,
-                materializeDatalessFiles: newConfig.suppression.materializeDataless,
-                scopePath: scopePath
-            )
-            let supp = DownloadSuppression(config: suppressionConfig, logger: logger)
-            supp.apply()
-            suppression = supp
-        }
-
-        if newConfig.watcher.metadataWatcherEnabled != oldConfig.watcher.metadataWatcherEnabled
-            || newConfig.watcher.backoffMaxSeconds != oldConfig.watcher.backoffMaxSeconds
-        {
-            stopRematerializationWatcher()
-            startRematerializationWatcherIfEnabled(using: newConfig)
-        }
-
-        if newConfig.watcher.pollutionCheckIntervalSeconds != oldConfig.watcher.pollutionCheckIntervalSeconds {
-            pollutionTimer?.cancel()
-            let interval = newConfig.watcher.pollutionCheckIntervalSeconds
-            let timer = DispatchSource.makeTimerSource(queue: DispatchQueue.global(qos: .utility))
-            timer.schedule(deadline: .now() + .seconds(interval), repeating: .seconds(interval))
-            timer.setEventHandler { [weak self] in
-                Task { [weak self] in await self?.checkPollution() }
-            }
-            timer.resume()
-            pollutionTimer = timer
-        }
-
-        config = newConfig
-    }
-
-    // MARK: - Eviction (streaming — no URL array materialization)
-
-    func runEviction() {
-        guard !isEvicting else { return }
-        isEvicting = true
-        eventHandler(.evictionStarted)
-
-        let handler = eventHandler
-        let scope = scopePath
-        let log = logger
-        let evLog = evictionLogger
-        let batchLimit = config.eviction.batchLimit
-        let protectedPaths = config.scope.protectedPaths
-
-        Task.detached {
-            let scopeURL = URL(fileURLWithPath: NSString(string: scope).expandingTildeInPath, isDirectory: true)
-            var evicted = 0
-            var failed = 0
-            var reclaimed: Int64 = 0
-            let fm = FileManager.default
-
-            if let enumerator = FileManager.default.enumerator(
-                at: scopeURL,
-                includingPropertiesForKeys: [.isRegularFileKey, .isUbiquitousItemKey, .ubiquitousItemDownloadingStatusKey],
-                options: [.skipsHiddenFiles]
-            ) {
-                BoundedURLEnumerator.forEachURL(in: enumerator, shouldStop: { evicted + failed >= batchLimit }) { url in
-                    guard url.lastPathComponent.hasPrefix(".") == false else { return }
-                    if isProtected(url: url, protectedPaths: protectedPaths) { return }
-                    let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .isUbiquitousItemKey, .ubiquitousItemDownloadingStatusKey])
-                    guard values?.isRegularFile == true else { return }
-                    guard values?.isUbiquitousItem == true else { return }
-                    guard values?.ubiquitousItemDownloadingStatus == .current
-                        || values?.ubiquitousItemDownloadingStatus == .downloaded else { return }
-                    let sizeBefore = fileSize(url: url)
-                    do {
-                        try fm.evictUbiquitousItem(at: url)
-                        evicted += 1
-                        reclaimed += sizeBefore
-                    } catch {
-                        failed += 1
-                    }
-                }
-            }
-
-            log.log("eviction evicted=\(evicted) failed=\(failed) reclaimed=\(reclaimed)")
-            evLog.log("eviction command=evict evicted=\(evicted) failed=\(failed) reclaimed=\(reclaimed)")
-            await Notifier.shared.notifyEvictionComplete(evictedCount: evicted, reclaimedBytes: reclaimed)
-            handler(.evictionResult(evicted: evicted, reclaimed: reclaimed))
-            handler(.evictionCompleted)
-            await self.clearEvicting()
-        }
-    }
-
-    func panicEvict() {
-        guard !isEvicting else { return }
-        isEvicting = true
-        eventHandler(.evictionStarted)
-
-        let handler = eventHandler
-        let scope = scopePath
-        let _ = logger
-        let evLog = evictionLogger
-        let panicLimit = config.eviction.panicLimit
-        let protectedPaths = config.scope.protectedPaths
-
-        Task.detached {
-            let scopeURL = URL(fileURLWithPath: NSString(string: scope).expandingTildeInPath, isDirectory: true)
-            var evicted = 0
-            var failed = 0
-            var reclaimed: Int64 = 0
-            let fm = FileManager.default
-
-            if let enumerator = FileManager.default.enumerator(
-                at: scopeURL,
-                includingPropertiesForKeys: [.isRegularFileKey, .isUbiquitousItemKey],
-                options: [.skipsHiddenFiles]
-            ) {
-                BoundedURLEnumerator.forEachURL(in: enumerator, shouldStop: { evicted + failed >= panicLimit }) { url in
-                    guard url.lastPathComponent.hasPrefix(".") == false else { return }
-                    if isProtected(url: url, protectedPaths: protectedPaths) { return }
-                    let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .isUbiquitousItemKey])
-                    guard values?.isRegularFile == true else { return }
-                    guard values?.isUbiquitousItem == true else { return }
-                    let sizeBefore = fileSize(url: url)
-                    do {
-                        try fm.evictUbiquitousItem(at: url)
-                        evicted += 1
-                        reclaimed += sizeBefore
-                    } catch {
-                        failed += 1
-                    }
-                }
-            }
-
-            evLog.log("eviction command=panic-evict evicted=\(evicted) failed=\(failed) reclaimed=\(reclaimed)")
-            await Notifier.shared.notifyEvictionComplete(evictedCount: evicted, reclaimedBytes: reclaimed)
-            handler(.evictionResult(evicted: evicted, reclaimed: reclaimed))
-            handler(.evictionCompleted)
-            await self.clearEvicting()
-        }
-    }
-
-    func previewEviction() {
-        let scope = scopePath
-        let batchLimit = config.eviction.batchLimit
-        let protectedPaths = config.scope.protectedPaths
-        let handler = eventHandler
-
-        Task.detached {
-            let scopeURL = URL(fileURLWithPath: NSString(string: scope).expandingTildeInPath, isDirectory: true)
-            var count = 0
-            var totalBytes: Int64 = 0
-
-            if let enumerator = FileManager.default.enumerator(
-                at: scopeURL,
-                includingPropertiesForKeys: [.isRegularFileKey, .isUbiquitousItemKey, .ubiquitousItemDownloadingStatusKey],
-                options: [.skipsHiddenFiles]
-            ) {
-                BoundedURLEnumerator.forEachURL(in: enumerator, shouldStop: { count >= batchLimit }) { url in
-                    guard url.lastPathComponent.hasPrefix(".") == false else { return }
-                    if isProtected(url: url, protectedPaths: protectedPaths) { return }
-                    let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .isUbiquitousItemKey, .ubiquitousItemDownloadingStatusKey])
-                    guard values?.isRegularFile == true else { return }
-                    guard values?.isUbiquitousItem == true else { return }
-                    guard values?.ubiquitousItemDownloadingStatus == .current
-                        || values?.ubiquitousItemDownloadingStatus == .downloaded else { return }
-                    count += 1
-                    totalBytes += fileSize(url: url)
-                }
-            }
-
-            handler(.evictionResult(evicted: 0, reclaimed: totalBytes))
-        }
-    }
-
-    func evictFolder(_ folderPath: String) {
-        guard !isEvicting else { return }
-        isEvicting = true
-        eventHandler(.evictionStarted)
-
-        let handler = eventHandler
-        let log = logger
-        let evLog = evictionLogger
-        let batchLimit = config.eviction.batchLimit
-        let protectedPaths = config.scope.protectedPaths
-
-        Task.detached {
-            let scopeURL = URL(fileURLWithPath: NSString(string: folderPath).expandingTildeInPath, isDirectory: true)
-            var evicted = 0
-            var failed = 0
-            var reclaimed: Int64 = 0
-            let fm = FileManager.default
-
-            if let enumerator = FileManager.default.enumerator(
-                at: scopeURL,
-                includingPropertiesForKeys: [.isRegularFileKey, .isUbiquitousItemKey, .ubiquitousItemDownloadingStatusKey],
-                options: [.skipsHiddenFiles]
-            ) {
-                BoundedURLEnumerator.forEachURL(in: enumerator, shouldStop: { evicted + failed >= batchLimit }) { url in
-                    guard url.lastPathComponent.hasPrefix(".") == false else { return }
-                    if isProtected(url: url, protectedPaths: protectedPaths) { return }
-                    let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .isUbiquitousItemKey, .ubiquitousItemDownloadingStatusKey])
-                    guard values?.isRegularFile == true else { return }
-                    guard values?.isUbiquitousItem == true else { return }
-                    guard values?.ubiquitousItemDownloadingStatus == .current
-                        || values?.ubiquitousItemDownloadingStatus == .downloaded else { return }
-                    let sizeBefore = fileSize(url: url)
-                    do {
-                        try fm.evictUbiquitousItem(at: url)
-                        evicted += 1
-                        reclaimed += sizeBefore
-                    } catch { failed += 1 }
-                }
-            }
-
-            log.log("folder-eviction path=\(folderPath) evicted=\(evicted) failed=\(failed) reclaimed=\(reclaimed)")
-            evLog.log("eviction command=folder-evict path=\(folderPath) evicted=\(evicted) failed=\(failed) reclaimed=\(reclaimed)")
-            await Notifier.shared.notifyEvictionComplete(evictedCount: evicted, reclaimedBytes: reclaimed)
-            handler(.evictionResult(evicted: evicted, reclaimed: reclaimed))
-            handler(.evictionCompleted)
-            await self.clearEvicting()
-        }
-    }
-
-    // MARK: - Rematerialization handling
-
-    private func handleRematerializationBatch(_ events: [RematerializationEvent]) async {
-        guard !events.isEmpty else { return }
-        // Single notification for the batch (Notifier already throttles internally)
-        if let lastEvent = events.last {
-            await Notifier.shared.notifyRematerialization(path: lastEvent.itemPath)
-        }
-        // Single event with the batch — avoids N MainActor dispatches
-        eventHandler(.rematerializationBatchDetected(events))
-    }
-
-    private func startRematerializationWatcherIfEnabled(using config: AppConfig) {
-        guard config.watcher.metadataWatcherEnabled else {
-            watcher?.stop()
-            watcher = nil
-            eventHandler(.watcherStopped)
-            logger.log("watcher disabled reason=config")
-            return
-        }
-
-        guard watcher == nil else { return }
-        let w = RematerializationWatcher(
+    private func startWatchlist(using config: AppConfig) {
+        let watcher = WatchlistWatcher(
             logger: logger,
-            evictorFactory: { logger in PackageAwareEvictor(logger: logger) },
-            maxBackoffSeconds: TimeInterval(config.watcher.backoffMaxSeconds)
+            protectedPaths: ProtectedPathsMatcher(patterns: config.scope.protectedPaths),
+            scopePath: scopePath,
+            backoffMaxSeconds: TimeInterval(config.watcher.backoffMaxSeconds)
         )
-        w.onRematerializationBatch = { [weak self] events in
-            Task { [weak self] in await self?.handleRematerializationBatch(events) }
-        }
-        w.start()
-        watcher = w
-        eventHandler(.watcherStarted)
-    }
-
-    private func stopRematerializationWatcher() {
-        watcher?.stop()
-        watcher = nil
-    }
-
-    // MARK: - Network monitor
-
-    private func startNetworkMonitor() {
-        let monitor = NWPathMonitor()
-        monitor.pathUpdateHandler = { [weak self] path in
-            guard path.status == .satisfied else { return }
+        watcher.onRematerialization = { [weak self] paths in
             Task { [weak self] in
                 guard let self else { return }
-                // Atomic check-and-set: prevents TOCTOU race during network flapping
-                let already = await self.tryClaimNetworkDispatch()
-                guard already else { return }
-                try? await Task.sleep(nanoseconds: 30_000_000_000)
-                await self.runEviction()
-                await self.setNetworkDispatched(false)
+                await self.handleRematerialization(paths)
             }
         }
-        monitor.start(queue: DispatchQueue.global(qos: .utility))
-        networkMonitor = monitor
-    }
-
-    /// Atomically check if network eviction is already dispatched and claim if not.
-    /// Returns true if the caller should proceed, false if another task already claimed it.
-    private func tryClaimNetworkDispatch() -> Bool {
-        if networkEvictionDispatched {
-            return false
+        watcher.onCountChange = { [weak self] count in
+            Task { [weak self] in
+                await self?.emitWatchlistCount(count)
+            }
         }
-        networkEvictionDispatched = true
-        return true
+        watcher.start(intervalSeconds: config.watcher.watchlistPollSeconds)
+        watchlist = watcher
+        eventHandler(.watchlistUpdated(count: watcher.count))
     }
 
-    private func setNetworkDispatched(_ value: Bool) {
-        networkEvictionDispatched = value
+    private func emitWatchlistCount(_ count: Int) {
+        eventHandler(.watchlistUpdated(count: count))
     }
 
-    // MARK: - Pollution check
+    private func handleRematerialization(_ paths: [String]) async {
+        if let last = paths.last {
+            await Notifier.shared.notifyRematerialization(path: last)
+        }
+        eventHandler(.rematerialized(paths: paths))
+    }
 
-    private func schedulePollutionCheck() {
-        let interval = config.watcher.pollutionCheckIntervalSeconds
+    // MARK: - Scheduled scan + policy
+
+    private func scheduleScanTimer(intervalSeconds: Int, fireImmediately: Bool) {
+        scanTimer?.cancel()
+        let interval = max(60, intervalSeconds)
         let timer = DispatchSource.makeTimerSource(queue: DispatchQueue.global(qos: .utility))
         timer.schedule(deadline: .now() + .seconds(interval), repeating: .seconds(interval))
         timer.setEventHandler { [weak self] in
-            Task { [weak self] in await self?.checkPollution() }
+            Task { [weak self] in
+                await self?.scheduledScan()
+            }
         }
         timer.resume()
-        pollutionTimer = timer
-        Task { await checkPollution() }
+        scanTimer = timer
+
+        if fireImmediately {
+            Task { await scheduledScan() }
+        }
     }
 
-    private func checkPollution() async {
-        let scopeURL = URL(fileURLWithPath: NSString(string: scopePath).expandingTildeInPath, isDirectory: true)
-        var materialized = 0
-        var dataless = 0
-        var folderSizes: [String: Int64] = [:]
+    /// The heartbeat: collect fresh stats, update the UI, persist a sample,
+    /// and let the policy engine decide whether to trim.
+    private func scheduledScan() async {
+        guard !isScanning else { return }
+        isScanning = true
+        defer { isScanning = false }
 
-        guard let enumerator = FileManager.default.enumerator(
-            at: scopeURL,
-            includingPropertiesForKeys: [],
-            options: [.skipsHiddenFiles]
-        ) else { return }
+        do {
+            let stats = try await collectStats()
+            lastStats = stats
+            lastScanAt = Date()
+            eventHandler(.statsUpdated(stats))
 
-        let scopePrefix = scopeURL.path + "/"
+            guard !isPaused, !isRunning else { return }
 
-        BoundedURLEnumerator.forEachURL(in: enumerator, shouldStop: { materialized + dataless >= 10000 }) { url in
-            guard url.lastPathComponent.hasPrefix(".") == false else { return }
-            var st = stat()
-            guard lstat(url.path, &st) == 0 else { return }
+            var state = (try? stateStore.load()) ?? GuardState()
+            state.samples = Self.trimmedSamples(
+                state.samples + [GuardSample(timestamp: Date(), localBytes: stats.materializedBytes, freeBytes: stats.freeBytes)]
+            )
+            try? stateStore.save(state)
 
-            let isDataless = (st.st_flags & SF_DATALESS) != 0
-            if isDataless {
-                dataless += 1
-            } else if st.st_size > 0 {
-                materialized += 1
+            let policy = PolicyMapping.corePolicy(from: config).normalized()
+            let scan = ScanResult(scopePath: scopePath, freeBytes: stats.freeBytes, localBytes: stats.materializedBytes, items: [])
+            let decision = PolicyEngine.evaluate(scan: scan, state: state, config: guardConfig(for: policy), now: Date())
+
+            switch decision.kind {
+            case .targeted:
+                logger.log("auto-trim reason=\(decision.reason) target=\(decision.reclaimTargetBytes)")
+                _ = await runEviction(
+                    kind: .trim,
+                    reason: decision.reason,
+                    byteBudget: decision.reclaimTargetBytes,
+                    fileBudget: config.eviction.batchLimit
+                )
+            case .panic:
+                logger.log("auto-panic reason=\(decision.reason)")
+                _ = await runEviction(
+                    kind: .panic,
+                    reason: decision.reason,
+                    byteBudget: nil,
+                    fileBudget: config.eviction.panicLimit
+                )
+            case .none, .cooldown:
+                break
+            }
+        } catch {
+            logger.log("scan-failed error=\(error)")
+            eventHandler(.error("Scan failed: \(error.localizedDescription)"))
+        }
+    }
+
+    private func collectStats() async throws -> DriveStats {
+        let scope = scopePath
+        return try await Task.detached(priority: .utility) {
+            try DriveStatsCollector.collect(scopePath: scope)
+        }.value
+    }
+
+    // MARK: - Manual actions
+
+    /// Manual trim toward the configured local-footprint target. Ignores
+    /// cooldown (user-initiated) but respects the target: if already under,
+    /// reports so instead of evicting needlessly.
+    @discardableResult
+    func trimNow(progress: ((EvictionProgress) -> Void)? = nil) async -> GuardRunReport {
+        let policy = PolicyMapping.corePolicy(from: config).normalized()
+        let stats: DriveStats
+        do {
+            stats = try await freshStats()
+        } catch {
+            eventHandler(.error("Scan failed: \(error.localizedDescription)"))
+            return GuardRunReport(kind: .trim, reason: "scan failed: \(error.localizedDescription)")
+        }
+        let reclaimTarget = max(stats.materializedBytes - policy.targetLocalBytes, 0)
+
+        guard reclaimTarget > 0 else {
+            let report = GuardRunReport(
+                kind: .trim,
+                reason: "already under \(formatBytes(policy.targetLocalBytes)) target"
+            )
+            eventHandler(.runFinished(report))
+            return report
+        }
+
+        return await runEviction(
+            kind: .trim,
+            reason: "trim toward \(formatBytes(policy.targetLocalBytes)) target",
+            byteBudget: reclaimTarget,
+            fileBudget: config.eviction.batchLimit,
+            progress: progress
+        )
+    }
+
+    /// Panic: evict everything eligible, up to the panic limit.
+    @discardableResult
+    func panicEvict(progress: ((EvictionProgress) -> Void)? = nil) async -> GuardRunReport {
+        await runEviction(
+            kind: .panic,
+            reason: "panic eviction",
+            byteBudget: nil,
+            fileBudget: config.eviction.panicLimit,
+            progress: progress
+        )
+    }
+
+    /// Dry-run: count candidates and bytes without evicting anything.
+    @discardableResult
+    func preview() async -> GuardRunReport {
+        guard !isRunning else {
+            return GuardRunReport(kind: .preview, reason: "another run is active")
+        }
+        isRunning = true
+        eventHandler(.runStarted(.preview))
+        defer {
+            isRunning = false
+            activeCancellation = nil
+        }
+
+        let cancellation = EvictionCancellation()
+        activeCancellation = cancellation
+        let engine = EvictionEngine(logger: logger)
+
+        do {
+            let candidates = try await collectCandidates(engine: engine, cancellation: cancellation)
+            let bytes = candidates.reduce(into: Int64(0)) { $0 += $1.allocatedBytes }
+            let report = GuardRunReport(
+                kind: .preview,
+                reason: "dry run",
+                candidateCount: candidates.count,
+                previewBytes: bytes
+            )
+            eventHandler(.runFinished(report))
+            return report
+        } catch {
+            eventHandler(.error("Preview failed: \(error.localizedDescription)"))
+            return GuardRunReport(kind: .preview, reason: "failed: \(error.localizedDescription)")
+        }
+    }
+
+    /// Evict all eligible files inside one top-level folder of the scope.
+    @discardableResult
+    func evictFolder(_ folderName: String) async -> GuardRunReport {
+        await runEviction(
+            kind: .folder,
+            reason: "evict folder \(folderName)",
+            byteBudget: nil,
+            fileBudget: config.eviction.batchLimit,
+            folderFilter: folderName
+        )
+    }
+
+    func cancelRun() {
+        activeCancellation?.cancel()
+    }
+
+    // MARK: - Eviction core
+
+    private func freshStats() async throws -> DriveStats {
+        if let lastStats, let lastScanAt, Date().timeIntervalSince(lastScanAt) < 60 {
+            return lastStats
+        }
+        let stats = try await collectStats()
+        lastStats = stats
+        lastScanAt = Date()
+        eventHandler(.statsUpdated(stats))
+        return stats
+    }
+
+    private func collectCandidates(
+        engine: EvictionEngine,
+        cancellation: EvictionCancellation,
+        progress: ((EvictionProgress) -> Void)? = nil
+    ) async throws -> [EvictionCandidate] {
+        let scope = scopePath
+        let protected = ProtectedPathsMatcher(patterns: config.scope.protectedPaths)
+        let handler = eventHandler
+        return try await Task.detached(priority: .utility) {
+            try engine.collectCandidates(
+                scopePath: scope,
+                protectedPaths: protected,
+                cancellation: cancellation
+            ) { update in
+                handler(.progress(update))
+                progress?(update)
+            }
+        }.value
+    }
+
+    private func runEviction(
+        kind: GuardRunKind,
+        reason: String,
+        byteBudget: Int64?,
+        fileBudget: Int,
+        folderFilter: String? = nil,
+        progress: ((EvictionProgress) -> Void)? = nil
+    ) async -> GuardRunReport {
+        guard !isRunning else {
+            return GuardRunReport(kind: kind, reason: "another run is active")
+        }
+        isRunning = true
+        eventHandler(.runStarted(kind))
+        defer {
+            isRunning = false
+            activeCancellation = nil
+        }
+
+        let cancellation = EvictionCancellation()
+        activeCancellation = cancellation
+        let engine = EvictionEngine(logger: logger)
+
+        do {
+            var candidates = try await collectCandidates(engine: engine, cancellation: cancellation, progress: progress)
+
+            if let folderFilter {
+                candidates = candidates.filter { candidate in
+                    candidate.relativePath.split(separator: "/").first.map(String.init) == folderFilter
+                }
             }
 
-            // Track top-level folder sizes — compute once per iteration
-            if !isDataless {
-                let relPath = url.path.replacingOccurrences(of: scopePrefix, with: "")
-                let topFolder = relPath.split(separator: "/").first.map(String.init) ?? "(root)"
-                folderSizes[topFolder, default: 0] += Int64(st.st_blocks) * 512
+            if cancellation.isCancelled {
+                let report = GuardRunReport(kind: kind, reason: "cancelled", candidateCount: candidates.count, cancelled: true)
+                eventHandler(.runFinished(report))
+                return report
             }
-        }
 
-        let total = materialized + dataless
-        let pollutionRatio = total > 0 ? Double(dataless) / Double(total) : 0
-        if pollutionRatio > 0.7 {
-            await Notifier.shared.notifyPollutionThreshold(ratio: pollutionRatio)
-        }
-
-        let freeBytes = freeDiskSpace(scopeURL: scopeURL)
-        let topFolders = folderSizes
-            .sorted { $0.value > $1.value }
-            .prefix(5)
-            .map { (name: $0.key, bytes: $0.value) }
-
-        eventHandler(.pollutionUpdated(materialized: materialized, dataless: dataless, freeSpace: freeBytes, folders: Array(topFolders)))
-
-        // Auto-evict on low disk — guarded against concurrent evictions
-        let freeGiB = Double(freeBytes) / (1024 * 1024 * 1024)
-        if !isPaused && !isEvicting && freeGiB > 0 && freeGiB < Double(config.policy.remediateFreeGiB) {
-            runEviction()
-        }
-    }
-
-    // MARK: - State management
-
-    private func clearEvicting() {
-        isEvicting = false
-    }
-}
-
-// MARK: - Helpers
-
-private func freeDiskSpace(scopeURL: URL) -> Int64 {
-    if let values = try? scopeURL.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey]),
-       let bytes = values.volumeAvailableCapacityForImportantUsage {
-        return Int64(bytes)
-    }
-    if let attrs = try? FileManager.default.attributesOfFileSystem(forPath: scopeURL.path),
-       let free = attrs[.systemFreeSize] as? NSNumber {
-        return free.int64Value
-    }
-    return 0
-}
-
-private func fileSize(url: URL) -> Int64 {
-    var st = stat()
-    guard lstat(url.path, &st) == 0 else { return 0 }
-    return Int64(st.st_blocks) * 512
-}
-
-private func isProtected(url: URL, protectedPaths: [String]) -> Bool {
-    let path = url.path
-    for protected in protectedPaths {
-        let expanded = NSString(string: protected).expandingTildeInPath
-        if path == expanded || path.hasPrefix(expanded + "/") {
-            return true
-        }
-        if expanded.contains("*") || expanded.contains("?") {
-            if fnmatch(expanded, path, 0) == 0 {
-                return true
+            guard !candidates.isEmpty else {
+                let report = GuardRunReport(kind: kind, reason: "nothing to evict")
+                eventHandler(.runFinished(report))
+                return report
             }
-            let relPath = url.lastPathComponent
-            if fnmatch(expanded, relPath, 0) == 0 {
-                return true
+
+            let handler = eventHandler
+            let outcome = await Task.detached(priority: .utility) {
+                engine.evict(
+                    candidates: candidates,
+                    byteBudget: byteBudget,
+                    fileBudget: fileBudget,
+                    cancellation: cancellation
+                ) { update in
+                    handler(.progress(update))
+                    progress?(update)
+                }
+            }.value
+
+            // Register evicted paths for rematerialization defense.
+            if !outcome.evictedPaths.isEmpty {
+                watchlist?.add(paths: outcome.evictedPaths)
+                eventHandler(.watchlistUpdated(count: watchlist?.count ?? 0))
             }
+
+            let report = GuardRunReport(
+                kind: kind,
+                reason: reason,
+                candidateCount: candidates.count,
+                evictedCount: outcome.evictedCount,
+                failedCount: outcome.failedCount,
+                reclaimedBytes: outcome.reclaimedBytes,
+                failureReasons: outcome.failureReasons,
+                cancelled: outcome.cancelled
+            )
+
+            evictionLogger.log(
+                "eviction command=\(kind.rawValue) evicted=\(outcome.evictedCount) failed=\(outcome.failedCount) " +
+                "verifiedReclaimed=\(outcome.reclaimedBytes) reasons=\(outcome.failureReasons)"
+            )
+
+            // Persist remediation state (shared cooldown with CLI).
+            var state = (try? stateStore.load()) ?? GuardState()
+            state.lastRemediationAt = Date()
+            state.lastSummary = GuardRunSummary(
+                timestamp: Date(),
+                action: kind == .panic ? .panic : .targeted,
+                reason: reason,
+                dryRun: false,
+                candidateCount: candidates.count,
+                evictedCount: outcome.evictedCount,
+                failedEvictionCount: outcome.failedCount,
+                reclaimedBytes: outcome.reclaimedBytes,
+                remainingLocalBytes: lastStats?.materializedBytes ?? 0,
+                remainingFreeBytes: lastStats?.freeBytes ?? 0,
+                escalatedToPanic: false
+            )
+            try? stateStore.save(state)
+
+            if outcome.evictedCount > 0 {
+                await Notifier.shared.notifyEvictionComplete(
+                    evictedCount: outcome.evictedCount,
+                    reclaimedBytes: outcome.reclaimedBytes
+                )
+            }
+
+            eventHandler(.runFinished(report))
+
+            // Refresh stats in the background so the UI converges to truth.
+            Task { await self.refreshStatsAfterRun() }
+
+            return report
+        } catch {
+            logger.log("run-failed kind=\(kind.rawValue) error=\(error)")
+            eventHandler(.error("Run failed: \(error.localizedDescription)"))
+            return GuardRunReport(kind: kind, reason: "failed: \(error.localizedDescription)")
         }
     }
-    return false
+
+    private func refreshStatsAfterRun() async {
+        guard !isScanning else { return }
+        isScanning = true
+        defer { isScanning = false }
+        if let stats = try? await collectStats() {
+            lastStats = stats
+            lastScanAt = Date()
+            eventHandler(.statsUpdated(stats))
+        }
+    }
+
+    // MARK: - IPC status
+
+    /// Text status for the CLI, matching the local-runner format.
+    func statusText() async -> String {
+        do {
+            let stats = try await freshStats()
+            let policy = PolicyMapping.corePolicy(from: config).normalized()
+            let state = (try? stateStore.load()) ?? GuardState()
+            let scan = ScanResult(scopePath: scopePath, freeBytes: stats.freeBytes, localBytes: stats.materializedBytes, items: [])
+            let decision = PolicyEngine.evaluate(scan: scan, state: state, config: guardConfig(for: policy), now: Date())
+
+            var lines: [String] = []
+            lines.append("Scope: \(scopePath)")
+            lines.append("Local iCloud footprint: \(formatBytes(stats.materializedBytes)) (\(stats.materializedFiles) files)")
+            lines.append("Evicted (dataless): \(stats.datalessFiles) files")
+            lines.append("Free space: \(formatBytes(stats.freeBytes))")
+            lines.append("Watchlist: \(watchlist?.count ?? 0) path(s)")
+            lines.append("Recent growth (\(policy.growthWindowMinutes)m): \(formatBytes(decision.growthBytes))")
+            lines.append("Next action: \(decision.kind.rawValue) (\(decision.reason))")
+            if let seconds = decision.cooldownRemainingSeconds {
+                lines.append("Cooldown remaining: \(seconds)s")
+            }
+            return lines.joined(separator: "\n")
+        } catch {
+            return "status unavailable: \(error.localizedDescription)"
+        }
+    }
+
+    // MARK: - Helpers
+
+    private func guardConfig(for policy: PolicyConfig) -> GuardConfig {
+        GuardConfig(
+            label: "app.icloud-guard",
+            logPath: AppPaths.log.path,
+            lockPath: AppPaths.lock.path,
+            scopePath: scopePath,
+            statePath: AppPaths.state.path,
+            notifications: NotificationConfig(enable: false),
+            policy: policy
+        )
+    }
+
+    static func trimmedSamples(_ samples: [GuardSample], now: Date = Date()) -> [GuardSample] {
+        let cutoff = now.addingTimeInterval(-24 * 60 * 60)
+        return Array(samples.filter { $0.timestamp >= cutoff }.suffix(288))
+    }
 }

@@ -41,25 +41,28 @@ stops the triggers before they happen:
 
 ### layer 2: correct eviction
 
-the right apis, used properly:
+the right apis, used properly (all verified on macos 26):
 
 - **[`FileManager.evictUbiquitousItem(at:)`](https://developer.apple.com/documentation/foundation/filemanager/evictubiquitousitem(at:))** — the only eviction api that works from a non-extension process. [`NSFileProviderManager(for: domain)`](https://developer.apple.com/documentation/fileprovider/nsfileprovidermanager) returns nil when called from a process that isn't the file provider extension itself (verified on macos 26.5.1), so `evictItem(identifier:)` is not available to us
-- **leaf-first package eviction** — for packages like `.fcpbundle`, evicts individual child files before the package root, avoiding the atomic `EBUSY` failure that occurs when any child has an open file descriptor. apple's [`evictItem` documentation](https://developer.apple.com/documentation/fileprovider/nsfileprovidermanager/evictitem(identifier:completionhandler:)) confirms: "if a non-evictable child is encountered, eviction will stop immediately"
-- **`SF_DATALESS` verification** — uses [`lstat(2)`](https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man2/lstat.2.html) to check the apfs `SF_DATALESS` flag (`0x40000000`) post-eviction. a truly dataless file has `st_blocks == 0` (zero allocated disk blocks) while `st_size > 0` (nonzero logical size)
+- **package-root eviction** — on macos 26, packages (`.app`, `.fcpbundle`, …) are single items to `fileproviderd`: evicting package *contents* fails with `NSFileNoSuchFileError` ("doesn't exist") and even apple's own `brctl evict` crashes on package children. so packages are detected (`NSWorkspace.isFilePackage`, cached per extension) and evicted as one unit at the root. a package that an app is holding open fails with `EBUSY` ("couldn't be locked") — that's honest, categorized as `busy` in the ui, and retried later instead of silently dropped
+- **`SF_DATALESS` residency detection** — the legacy `ubiquitousItemDownloadingStatus` url resource keys return nil for every file on macos 26 (verified: 150/150 materialized files), so eligibility is computed from [`lstat(2)`](https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man2/lstat.2.html): a file is evictable when it's a regular file without the apfs `SF_DATALESS` flag (`0x40000000`) and has `st_blocks > 0`. every eviction is re-verified the same way, so "reclaimed bytes" is measured, never assumed
+- **bulk scanning** — the full drive is scanned with `getattrlistbulk(2)` (one syscall per directory batch) plus targeted `lstat` on materialized files only. a ~425k-file icloud drive scans in ~13 seconds instead of the several minutes that per-file `URL.resourceValues` xpc round trips took
 
-### layer 3: active defense (watch + re-evict)
+### layer 3: active defense (watchlist + re-evict)
 
 detects and reverses rematerialization within seconds:
 
-- **[`NSMetadataQuery`](https://developer.apple.com/documentation/foundation/nsmetadataquery) watcher** — scoped to `NSMetadataQueryUbiquitousDocumentsScope`, monitors `ubiquitousItemDownloadingStatus` changes. when an evicted item transitions from `.notDownloaded` to `.current` or `.downloaded`, it immediately re-evicts
-- **exponential backoff** — starts at 1s delay, doubles up to 60s max, resets when stable for 5 minutes. prevents fighting `fileproviderd` in a tight cpu-burning loop
+- **watchlist watcher** — every evicted path is recorded in `~/.icloud-guard/watchlist.json` and polled with `lstat(2)` every few seconds (microseconds per path, no spotlight dependency — so it works while spotlight suppression is active, and it doesn't rely on the download-status attributes that are broken on macos 26). a path that becomes resident again is re-evicted immediately
+- **exponential backoff + fighting detection** — re-eviction backoff doubles per rematerialization (up to a configurable max, default 60s). files that keep bouncing back past the fight threshold are flagged as "fighting" in the ui instead of burning cpu in an infinite war with `fileproviderd`; files that stay dataless graduate out of the watchlist after a stable period
 
-### layer 4: system mitigation
+in practice this matters: in testing, icloud re-downloaded ~7 gb of freshly evicted packages within ~10 minutes. the watchlist plus the policy loop is what turns a one-time cleanup into a held line.
 
-aggressive last-resort measures:
+### layer 4: policy-driven trimming (always on, in the app)
 
-- **[`pauseSync(forUbiquitousItem:)`](https://developer.apple.com/documentation/foundation/filemanager/pausesyncforubiquitousitem(at:))** on individual leaf files inside packages (can't pause on package directories — apple explicitly restricts this to non-package items)
-- the watcher handles re-eviction as the primary defense
+the menu bar app itself runs the policy engine — no launchd job required:
+
+- **auto-trim** — every scan interval (default 300s) the drive's real footprint is measured; when it exceeds the trim trigger (default 8 gib), the largest/oldest files and packages are evicted until the footprint is back at the target (default 5 gib). free-space floors (warn/remediate/panic) and a growth-rate trigger act as additional tripwires, with a cooldown between runs
+- **cli parity** — `icloud-guard status|evict|panic-evict` talks to the running app over an authenticated unix socket (streaming progress), and falls back to the exact same engine in-process when the app isn't running
 
 ## what it doesn't do
 
