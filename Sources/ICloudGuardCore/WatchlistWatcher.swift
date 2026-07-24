@@ -64,6 +64,8 @@ public final class WatchlistWatcher {
 
     /// Called with paths that rematerialized and were re-evicted.
     public var onRematerialization: (([String]) -> Void)?
+    /// Called with paths that are stuck in an eviction/rematerialization war.
+    public var onFighting: (([String]) -> Void)?
     /// Called when the watchlist count changes.
     public var onCountChange: ((Int) -> Void)?
 
@@ -170,7 +172,7 @@ public final class WatchlistWatcher {
         stop()
         let interval = max(1, intervalSeconds)
         let timer = DispatchSource.makeTimerSource(queue: DispatchQueue.global(qos: .utility))
-        timer.schedule(deadline: .now() + .seconds(interval), repeating: .seconds(interval))
+        timer.schedule(deadline: .now() + .seconds(interval), repeating: .seconds(interval), leeway: .milliseconds(500))
         timer.setEventHandler { [weak self] in
             _ = self?.pollOnce()
         }
@@ -280,6 +282,10 @@ public final class WatchlistWatcher {
             logger.log("watchlist rematerialized=\(rematerialized.count) reEvicted=\(outcome.reEvictedPaths.count) fighting=\(outcome.fightingPaths.count)")
             onRematerialization?(rematerialized)
             onCountChange?(count)
+        }
+
+        if !outcome.fightingPaths.isEmpty {
+            onFighting?(outcome.fightingPaths)
         }
 
         return outcome

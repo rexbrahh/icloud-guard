@@ -14,6 +14,10 @@ public struct DriveStats: Equatable, Sendable {
     public var freeBytes: Int64 = 0
     /// Top-level folders by materialized bytes, descending.
     public var topFolders: [FolderUsage] = []
+    /// Wall-clock seconds the scan took.
+    public var scanDurationSeconds: Double = 0
+    /// When the scan finished.
+    public var completedAt: Date = .distantPast
 
     public init() {}
 
@@ -46,6 +50,7 @@ public enum DriveStatsCollector {
     ) throws -> DriveStats {
         var stats = DriveStats()
         var folderBytes: [String: Int64] = [:]
+        let startedAt = Date()
 
         try BulkScanner.scan(rootPath: scopePath, shouldStop: shouldStop) { entry in
             onEntry?(entry)
@@ -68,6 +73,8 @@ public enum DriveStatsCollector {
             }
             .prefix(topFolderLimit)
             .map { FolderUsage(name: $0.key, bytes: $0.value) }
+        stats.scanDurationSeconds = Date().timeIntervalSince(startedAt)
+        stats.completedAt = Date()
         return stats
     }
 

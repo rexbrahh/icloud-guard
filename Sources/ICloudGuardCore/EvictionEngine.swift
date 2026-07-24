@@ -1,4 +1,3 @@
-import AppKit
 import Darwin
 import Foundation
 
@@ -46,6 +45,9 @@ public struct EvictionProgress: Equatable, Sendable {
     public var currentPath: String?
     /// Failure reason → count, e.g. "busy" → 3.
     public var failureReasons: [String: Int] = [:]
+    /// Byte goal of the run, when trimming toward a target. Drives the
+    /// byte-based progress fraction in the UI.
+    public var byteBudget: Int64?
 
     public init() {}
 
@@ -58,7 +60,8 @@ public struct EvictionProgress: Equatable, Sendable {
         failedCount: Int = 0,
         reclaimedBytes: Int64 = 0,
         currentPath: String? = nil,
-        failureReasons: [String: Int] = [:]
+        failureReasons: [String: Int] = [:],
+        byteBudget: Int64? = nil
     ) {
         self.phase = phase
         self.scannedFiles = scannedFiles
@@ -69,6 +72,7 @@ public struct EvictionProgress: Equatable, Sendable {
         self.reclaimedBytes = reclaimedBytes
         self.currentPath = currentPath
         self.failureReasons = failureReasons
+        self.byteBudget = byteBudget
     }
 
     /// One-line summary of the dominant failure reason, if any.
@@ -143,107 +147,30 @@ public final class EvictionEngine {
     /// Bulk-scan the scope and return all eviction candidates, sorted by
     /// size descending then oldest-modified first.
     ///
-    /// Package directories (.app, .fcpbundle, …) are detected with
-    /// `NSWorkspace.isFilePackage` and collapsed into single package-root
-    /// candidates with aggregated bytes. A package is excluded entirely if
-    /// any of its contents match a protected path.
+    /// Thin wrapper over `ScanOrchestrator` (which collects drive stats in
+    /// the same walk). Packages (.app, .fcpbundle, …) are collapsed into
+    /// single package-root candidates with aggregated bytes; a package is
+    /// excluded entirely if any of its contents match a protected path.
     public func collectCandidates(
         scopePath: String,
         protectedPaths: ProtectedPathsMatcher,
         cancellation: EvictionCancellation? = nil,
         onProgress: ((EvictionProgress) -> Void)? = nil
     ) throws -> [EvictionCandidate] {
-        var plainCandidates: [EvictionCandidate] = []
-        var packageDirectories: Set<String> = []
-        var packageAggregates: [String: (relativePath: String, bytes: Int64, oldest: Date?, protected: Bool)] = [:]
-        // Package-ness is a property of the extension's UTI declaration —
-        // cache per extension to avoid repeated LaunchServices lookups.
-        var packageKindByExtension: [String: Bool] = [:]
         var progress = EvictionProgress(phase: .scanning)
-        var lastProgressAt = Date.distantPast
-
-        try BulkScanner.scan(
-            rootPath: scopePath,
+        let bundle = try ScanOrchestrator.scan(
+            scopePath: scopePath,
+            protectedPaths: protectedPaths,
             shouldStop: { cancellation?.isCancelled ?? false }
-        ) { entry in
-            if entry.isDirectory {
-                let ext = URL(fileURLWithPath: entry.path).pathExtension
-                if !ext.isEmpty {
-                    let isPackage: Bool
-                    if let cached = packageKindByExtension[ext] {
-                        isPackage = cached
-                    } else {
-                        isPackage = isFilePackage(entry.path)
-                        packageKindByExtension[ext] = isPackage
-                    }
-                    if isPackage {
-                        packageDirectories.insert(entry.path)
-                    }
-                }
-                return
-            }
-
-            progress.scannedFiles += 1
-
-            if entry.isLocallyResidentFile {
-                let isProtected = protectedPaths.isProtected(path: entry.path, relativePath: entry.relativePath)
-
-                if let packageRoot = nearestPackageAncestor(of: entry.path, in: packageDirectories) {
-                    var aggregate = packageAggregates[packageRoot]
-                        ?? (relativePath: entry.relativePath, bytes: 0, oldest: nil, protected: false)
-                    aggregate.bytes += entry.allocatedBytes
-                    if let date = entry.modificationDate, aggregate.oldest == nil || date < aggregate.oldest! {
-                        aggregate.oldest = date
-                    }
-                    if isProtected {
-                        aggregate.protected = true
-                    }
-                    packageAggregates[packageRoot] = aggregate
-                } else if !isProtected {
-                    plainCandidates.append(EvictionCandidate(
-                        path: entry.path,
-                        relativePath: entry.relativePath,
-                        allocatedBytes: entry.allocatedBytes,
-                        modificationDate: entry.modificationDate
-                    ))
-                }
-
-                progress.candidateCount = plainCandidates.count + packageAggregates.count
-                progress.candidateBytes += entry.allocatedBytes
-            }
-
-            let now = Date()
-            if now.timeIntervalSince(lastProgressAt) >= progressInterval {
-                lastProgressAt = now
-                onProgress?(progress)
-            }
+        ) { scannedFiles in
+            progress.scannedFiles = scannedFiles
+            onProgress?(progress)
         }
 
-        let packageCandidates: [EvictionCandidate] = packageAggregates.compactMap { path, aggregate in
-            guard !aggregate.protected else { return nil }
-            guard !protectedPaths.isProtected(path: path, relativePath: aggregate.relativePath) else { return nil }
-            return EvictionCandidate(
-                path: path,
-                relativePath: aggregate.relativePath,
-                allocatedBytes: aggregate.bytes,
-                modificationDate: aggregate.oldest,
-                isPackageRoot: true
-            )
-        }
-
-        var candidates = plainCandidates + packageCandidates
-        candidates.sort { lhs, rhs in
-            if lhs.allocatedBytes != rhs.allocatedBytes { return lhs.allocatedBytes > rhs.allocatedBytes }
-            let lhsDate = lhs.modificationDate ?? .distantPast
-            let rhsDate = rhs.modificationDate ?? .distantPast
-            if lhsDate != rhsDate { return lhsDate < rhsDate }
-            return lhs.relativePath < rhs.relativePath
-        }
-
-        progress.candidateCount = candidates.count
-        progress.candidateBytes = candidates.reduce(into: Int64(0)) { $0 += $1.allocatedBytes }
+        progress.candidateCount = bundle.candidates.count
+        progress.candidateBytes = bundle.candidates.reduce(into: Int64(0)) { $0 += $1.allocatedBytes }
         onProgress?(progress)
-        return candidates
+        return bundle.candidates
     }
 
     // MARK: - Eviction
@@ -259,7 +186,7 @@ public final class EvictionEngine {
         cancellation: EvictionCancellation? = nil,
         onProgress: ((EvictionProgress) -> Void)? = nil
     ) -> EvictionOutcome {
-        var progress = EvictionProgress(phase: .evicting)
+        var progress = EvictionProgress(phase: .evicting, byteBudget: byteBudget)
         progress.candidateCount = candidates.count
         progress.candidateBytes = candidates.reduce(into: Int64(0)) { $0 += $1.allocatedBytes }
 
@@ -317,25 +244,6 @@ public final class EvictionEngine {
     }
 
     // MARK: - Single-file eviction
-
-    /// Nearest ancestor directory of `path` that is a known package, if any.
-    private func nearestPackageAncestor(of path: String, in packageDirectories: Set<String>) -> String? {
-        guard !packageDirectories.isEmpty else { return nil }
-        var current = (path as NSString).deletingLastPathComponent
-        while current.count > 1 {
-            if packageDirectories.contains(current) {
-                return current
-            }
-            let parent = (current as NSString).deletingLastPathComponent
-            if parent == current { break }
-            current = parent
-        }
-        return nil
-    }
-
-    private func isFilePackage(_ path: String) -> Bool {
-        NSWorkspace.shared.isFilePackage(atPath: path)
-    }
 
     private enum SingleEvictionResult {
         case evicted(freedBytes: Int64)

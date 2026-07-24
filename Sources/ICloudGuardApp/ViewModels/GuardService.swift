@@ -46,6 +46,8 @@ public struct GuardRunReport: Equatable, Sendable {
 public enum GuardServiceEvent {
     /// Fresh drive statistics (materialized/dataless counts, bytes, folders, free space).
     case statsUpdated(DriveStats)
+    /// Background scan is walking the drive (files scanned so far).
+    case scanProgress(scannedFiles: Int)
     /// Live progress during a scan/eviction run.
     case progress(EvictionProgress)
     case runStarted(GuardRunKind)
@@ -53,6 +55,8 @@ public enum GuardServiceEvent {
     case suppressionApplied(Bool)
     case watchlistUpdated(count: Int)
     case rematerialized(paths: [String])
+    case fighting(paths: [String])
+    case cooldownUpdated(seconds: Int?)
     case pausedChanged(Bool)
     case error(String)
 }
@@ -175,6 +179,11 @@ actor GuardService {
                 await self.handleRematerialization(paths)
             }
         }
+        watcher.onFighting = { [weak self] paths in
+            Task { [weak self] in
+                await self?.eventHandler(.fighting(paths: paths))
+            }
+        }
         watcher.onCountChange = { [weak self] count in
             Task { [weak self] in
                 await self?.emitWatchlistCount(count)
@@ -202,7 +211,7 @@ actor GuardService {
         scanTimer?.cancel()
         let interval = max(60, intervalSeconds)
         let timer = DispatchSource.makeTimerSource(queue: DispatchQueue.global(qos: .utility))
-        timer.schedule(deadline: .now() + .seconds(interval), repeating: .seconds(interval))
+        timer.schedule(deadline: .now() + .seconds(interval), repeating: .seconds(interval), leeway: .seconds(max(5, interval / 10)))
         timer.setEventHandler { [weak self] in
             Task { [weak self] in
                 await self?.scheduledScan()
@@ -216,30 +225,32 @@ actor GuardService {
         }
     }
 
-    /// The heartbeat: collect fresh stats, update the UI, persist a sample,
-    /// and let the policy engine decide whether to trim.
+    /// The heartbeat: ONE tree walk producing stats + candidates, then the
+    /// policy engine decides whether to trim — using those same candidates,
+    /// so a scheduled trim never walks the drive twice.
     private func scheduledScan() async {
         guard !isScanning else { return }
         isScanning = true
         defer { isScanning = false }
 
         do {
-            let stats = try await collectStats()
-            lastStats = stats
+            let bundle = try await orchestrateScan(cancellation: nil)
+            lastStats = bundle.stats
             lastScanAt = Date()
-            eventHandler(.statsUpdated(stats))
+            eventHandler(.statsUpdated(bundle.stats))
 
             guard !isPaused, !isRunning else { return }
 
             var state = (try? stateStore.load()) ?? GuardState()
             state.samples = Self.trimmedSamples(
-                state.samples + [GuardSample(timestamp: Date(), localBytes: stats.materializedBytes, freeBytes: stats.freeBytes)]
+                state.samples + [GuardSample(timestamp: Date(), localBytes: bundle.stats.materializedBytes, freeBytes: bundle.stats.freeBytes)]
             )
             try? stateStore.save(state)
 
             let policy = PolicyMapping.corePolicy(from: config).normalized()
-            let scan = ScanResult(scopePath: scopePath, freeBytes: stats.freeBytes, localBytes: stats.materializedBytes, items: [])
+            let scan = ScanResult(scopePath: scopePath, freeBytes: bundle.stats.freeBytes, localBytes: bundle.stats.materializedBytes, items: [])
             let decision = PolicyEngine.evaluate(scan: scan, state: state, config: guardConfig(for: policy), now: Date())
+            eventHandler(.cooldownUpdated(seconds: decision.cooldownRemainingSeconds))
 
             switch decision.kind {
             case .targeted:
@@ -248,7 +259,8 @@ actor GuardService {
                     kind: .trim,
                     reason: decision.reason,
                     byteBudget: decision.reclaimTargetBytes,
-                    fileBudget: config.eviction.batchLimit
+                    fileBudget: config.eviction.batchLimit,
+                    precollected: bundle.candidates
                 )
             case .panic:
                 logger.log("auto-panic reason=\(decision.reason)")
@@ -256,7 +268,8 @@ actor GuardService {
                     kind: .panic,
                     reason: decision.reason,
                     byteBudget: nil,
-                    fileBudget: config.eviction.panicLimit
+                    fileBudget: config.eviction.panicLimit,
+                    precollected: bundle.candidates
                 )
             case .none, .cooldown:
                 break
@@ -265,6 +278,30 @@ actor GuardService {
             logger.log("scan-failed error=\(error)")
             eventHandler(.error("Scan failed: \(error.localizedDescription)"))
         }
+    }
+
+    /// One orchestrated walk on a detached task, forwarding scan progress.
+    private func orchestrateScan(cancellation: EvictionCancellation?) async throws -> ScanBundle {
+        let scope = scopePath
+        let protected = ProtectedPathsMatcher(patterns: config.scope.protectedPaths)
+        let handler = eventHandler
+        return try await Task.detached(priority: .utility) {
+            try ScanOrchestrator.scan(
+                scopePath: scope,
+                protectedPaths: protected,
+                shouldStop: { cancellation?.isCancelled ?? false }
+            ) { files in
+                handler(.scanProgress(scannedFiles: files))
+            }
+        }.value
+    }
+
+    /// Menu-open hook: rescan only when the data is genuinely stale and
+    /// nothing else is already walking the drive.
+    func scanIfStale(maxAgeSeconds: TimeInterval) async {
+        guard !isScanning, !isRunning, !isPaused else { return }
+        if let last = lastScanAt, Date().timeIntervalSince(last) < maxAgeSeconds { return }
+        await scheduledScan()
     }
 
     private func collectStats() async throws -> DriveStats {
@@ -281,6 +318,13 @@ actor GuardService {
     /// reports so instead of evicting needlessly.
     @discardableResult
     func trimNow(progress: ((EvictionProgress) -> Void)? = nil) async -> GuardRunReport {
+        // Wait for any in-flight scan instead of launching a competing walk.
+        var waited = 0.0
+        while isScanning, waited < 90 {
+            try? await Task.sleep(nanoseconds: 250_000_000)
+            waited += 0.25
+        }
+
         let policy = PolicyMapping.corePolicy(from: config).normalized()
         let stats: DriveStats
         do {
@@ -410,6 +454,7 @@ actor GuardService {
         byteBudget: Int64?,
         fileBudget: Int,
         folderFilter: String? = nil,
+        precollected: [EvictionCandidate]? = nil,
         progress: ((EvictionProgress) -> Void)? = nil
     ) async -> GuardRunReport {
         guard !isRunning else {
@@ -427,7 +472,17 @@ actor GuardService {
         let engine = EvictionEngine(logger: logger)
 
         do {
-            var candidates = try await collectCandidates(engine: engine, cancellation: cancellation, progress: progress)
+            var candidates: [EvictionCandidate]
+            if let precollected {
+                candidates = precollected
+            } else {
+                // One walk that also refreshes the stats shown in the UI.
+                let bundle = try await orchestrateScan(cancellation: cancellation)
+                lastStats = bundle.stats
+                lastScanAt = Date()
+                eventHandler(.statsUpdated(bundle.stats))
+                candidates = bundle.candidates
+            }
 
             if let folderFilter {
                 candidates = candidates.filter { candidate in
