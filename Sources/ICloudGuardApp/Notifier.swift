@@ -31,8 +31,9 @@ actor Notifier {
         hasAuthorized = true
     }
 
-    /// Send a local notification.
+    /// Send a local notification. Honors the user's Settings toggle.
     func notify(identifier: String, title: String, body: String, threadIdentifier: String? = nil) async {
+        guard UserDefaults.standard.bool(forKey: "notificationsEnabled") else { return }
         await ensureAuthorized()
 
         let content = UNMutableNotificationContent()

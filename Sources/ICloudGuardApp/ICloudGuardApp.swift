@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import ServiceManagement
 import UserNotifications
 import ICloudGuardCore
 
@@ -14,6 +15,7 @@ public struct ICloudGuardApp: App {
         AppPaths.ensureHomeDir()
         AppPaths.seedDefaultConfigIfMissing()
         UNUserNotificationCenter.current().delegate = NotificationCenterDelegate.shared
+        UserDefaults.standard.register(defaults: ["notificationsEnabled": true])
 
         // Write PID file so CLI can detect the running GUI
         try? AppPaths.writePID()
@@ -73,12 +75,21 @@ public struct ICloudGuardApp: App {
 }
 
 private final class AppDelegate: NSObject, NSApplicationDelegate {
-    func applicationWillTerminate(_ notification: Notification) {
-        AppPaths.unlinkSocket()
-        AppPaths.removePID()
-    }
+    /// Held for the app's lifetime: keeps scan and watchlist timers from
+    /// being deferred by App Nap. Does NOT prevent system sleep.
+    private var activity: NSObjectProtocol?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        activity = ProcessInfo.processInfo.beginActivity(
+            options: [.userInitiated],
+            reason: "iCloud Guard background scanning"
+        )
+
+        // Register launch-at-login if the preference says so (idempotent).
+        if UserDefaults.standard.bool(forKey: "runAtLogin") {
+            try? SMAppService.mainApp.register()
+        }
+
         // Global hotkey: Cmd+Shift+E to trigger eviction
         NSEvent.addGlobalMonitorForEvents(matching: .keyDown) { event in
             if event.modifierFlags.contains([.command, .shift]) && event.charactersIgnoringModifiers?.lowercased() == "e" {
@@ -87,6 +98,11 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
                 }
             }
         }
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        AppPaths.unlinkSocket()
+        AppPaths.removePID()
     }
 }
 

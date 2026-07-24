@@ -19,9 +19,20 @@ struct GuardStatus: Equatable {
     var topFolders: [FolderUsage] = []
     var hasStats = false
 
+    // Scan state
+    var scanInProgress = false
+    var scanFilesScanned = 0
+    var lastScanCompletedAt: Date?
+    var lastScanDuration: Double = 0
+    var cooldownRemainingSeconds: Int?
+
+    // Watchlist
+    var fightingCount = 0
+
     // Active run
     var activeRunKind: GuardRunKind?
     var progress: EvictionProgress?
+    var runStartedAt: Date?
 
     // Last completed run
     var lastReport: GuardRunReport?
@@ -138,6 +149,68 @@ final class GuardViewModel: ObservableObject {
         status.hasStats && status.materializedBytes <= targetLocalBytes
     }
 
+    // MARK: - Progress presentation
+
+    func progressFraction(_ progress: EvictionProgress) -> Double {
+        if let budget = progress.byteBudget, budget > 0 {
+            return min(Double(progress.reclaimedBytes) / Double(budget), 1)
+        }
+        let processed = progress.evictedCount + progress.failedCount
+        guard progress.candidateCount > 0 else { return 0 }
+        return min(Double(processed) / Double(progress.candidateCount), 1)
+    }
+
+    /// "12/318 files · 145 MB/s · ~38s left"
+    func progressDetail(_ progress: EvictionProgress) -> String {
+        var parts: [String] = []
+        let processed = progress.evictedCount + progress.failedCount
+        parts.append("\(processed)/\(progress.candidateCount) files")
+        parts.append("\(formatBytes(progress.reclaimedBytes)) reclaimed")
+
+        if let startedAt = status.runStartedAt {
+            let elapsed = max(Date().timeIntervalSince(startedAt), 0.1)
+            let bytesPerSecond = Double(progress.reclaimedBytes) / elapsed
+            if bytesPerSecond > 0 {
+                parts.append("\(formatBytes(Int64(bytesPerSecond)))/s")
+
+                let remaining: Int64? = {
+                    if let budget = progress.byteBudget { return max(budget - progress.reclaimedBytes, 0) }
+                    return nil
+                }()
+                if let remaining, remaining > 0 {
+                    let eta = Int((Double(remaining) / bytesPerSecond).rounded())
+                    if eta > 0, eta < 3600 {
+                        parts.append("~\(eta)s left")
+                    }
+                }
+            }
+        }
+        return parts.joined(separator: " · ")
+    }
+
+    // MARK: - Freshness
+
+    /// Cheap volume-capacity refresh for every menu open — no scan needed.
+    func refreshFreeSpace() {
+        let scope = ConfigStore().load().scope.path
+        let free = DriveStatsCollector.freeDiskBytes(scopePath: scope)
+        guard free > 0, free != status.freeBytes else { return }
+        var next = status
+        next.freeBytes = free
+        status = next
+    }
+
+    func requestScanIfStale() {
+        Task { await guardService?.scanIfStale(maxAgeSeconds: 60) }
+    }
+
+    func dismissError() {
+        guard status.lastError != nil else { return }
+        var next = status
+        next.lastError = nil
+        status = next
+    }
+
     // MARK: - Service lifecycle
 
     func startGuardService(scopePath: String) {
@@ -166,52 +239,80 @@ final class GuardViewModel: ObservableObject {
 
     // MARK: - Events → status
 
+    /// Coalesced: mutate one local copy and assign once — a single
+    /// objectWillChange per event instead of up to a dozen.
     private func handleServiceEvent(_ event: GuardServiceEvent) {
+        var next = status
+
         switch event {
         case .statsUpdated(let stats):
-            status.materializedFiles = stats.materializedFiles
-            status.datalessFiles = stats.datalessFiles
-            status.materializedBytes = stats.materializedBytes
-            status.freeBytes = stats.freeBytes
-            status.topFolders = stats.topFolders
-            status.hasStats = true
-            status.lastError = nil
+            next.materializedFiles = stats.materializedFiles
+            next.datalessFiles = stats.datalessFiles
+            next.materializedBytes = stats.materializedBytes
+            next.freeBytes = stats.freeBytes
+            next.topFolders = stats.topFolders
+            next.hasStats = true
+            next.scanInProgress = false
+            next.lastScanCompletedAt = stats.completedAt
+            next.lastScanDuration = stats.scanDurationSeconds
+            next.lastError = nil
+
+        case .scanProgress(let files):
+            next.scanInProgress = true
+            next.scanFilesScanned = files
 
         case .progress(let progress):
-            status.progress = progress
+            next.progress = progress
 
         case .runStarted(let kind):
-            status.activeRunKind = kind
-            status.progress = nil
-            status.lastError = nil
+            next.activeRunKind = kind
+            next.progress = nil
+            next.runStartedAt = Date()
+            next.lastError = nil
 
         case .runFinished(let report):
-            status.activeRunKind = nil
-            status.progress = nil
-            status.lastReport = report
+            next.activeRunKind = nil
+            next.progress = nil
+            next.runStartedAt = nil
+            next.lastReport = report
             if report.evictedCount > 0 || report.reclaimedBytes > 0 {
-                status.lifetimeEvictedCount += report.evictedCount
-                status.lifetimeReclaimedBytes += report.reclaimedBytes
-                saveLifetimeStats()
+                next.lifetimeEvictedCount += report.evictedCount
+                next.lifetimeReclaimedBytes += report.reclaimedBytes
             }
 
         case .suppressionApplied(let active):
-            status.suppressionActive = active
+            next.suppressionActive = active
 
         case .watchlistUpdated(let count):
-            status.watchlistCount = count
+            next.watchlistCount = count
 
         case .rematerialized(let paths):
-            status.rematerializedTotal += paths.count
-            status.lastRematerializedPath = paths.last
+            next.rematerializedTotal += paths.count
+            next.lastRematerializedPath = paths.last
+
+        case .fighting(let paths):
+            next.fightingCount = paths.count
+
+        case .cooldownUpdated(let seconds):
+            next.cooldownRemainingSeconds = seconds
 
         case .pausedChanged(let paused):
-            status.isPaused = paused
+            next.isPaused = paused
 
         case .error(let message):
-            status.lastError = message
-            status.activeRunKind = nil
-            status.progress = nil
+            next.lastError = message
+            next.activeRunKind = nil
+            next.progress = nil
+            next.scanInProgress = false
+        }
+
+        let lifetimeChanged = next.lifetimeEvictedCount != status.lifetimeEvictedCount
+            || next.lifetimeReclaimedBytes != status.lifetimeReclaimedBytes
+        if next != status {
+            status = next
+        }
+        if lifetimeChanged {
+            saveLifetimeStats()
         }
     }
 

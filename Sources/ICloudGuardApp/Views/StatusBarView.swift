@@ -26,10 +26,22 @@ struct StatusBarView: View {
             }
 
             if let error = viewModel.status.lastError {
-                Text(error)
-                    .font(.system(size: 10))
-                    .foregroundStyle(.red)
-                    .lineLimit(2)
+                HStack(alignment: .top, spacing: 4) {
+                    Text(error)
+                        .font(.system(size: 10))
+                        .foregroundStyle(.red)
+                        .lineLimit(2)
+                    Spacer()
+                    Button {
+                        viewModel.dismissError()
+                    } label: {
+                        Image(systemName: "xmark.circle.fill")
+                            .font(.system(size: 11))
+                            .foregroundStyle(.secondary)
+                    }
+                    .buttonStyle(.borderless)
+                    .help("Dismiss")
+                }
             }
 
             Divider()
@@ -42,6 +54,8 @@ struct StatusBarView: View {
         .onAppear {
             viewModel.startGuardService(scopePath: configModel.config.scope.path)
             viewModel.refreshPolicyCache()
+            viewModel.refreshFreeSpace()
+            viewModel.requestScanIfStale()
         }
         .confirmationDialog(
             "Panic evict everything eligible? Local copies are removed; cloud copies are retained.",
@@ -89,12 +103,19 @@ struct StatusBarView: View {
                     .font(.system(size: 10, design: .monospaced))
                     .foregroundStyle(.secondary)
             } else {
-                ProgressView(value: progressFraction(progress))
+                ProgressView(value: viewModel.progressFraction(progress))
                     .progressViewStyle(.linear)
                     .frame(height: 4)
-                Text("\(progress.evictedCount)/\(progress.candidateCount) evicted · \(viewModel.formatBytes(progress.reclaimedBytes)) reclaimed")
+                Text(viewModel.progressDetail(progress))
                     .font(.system(size: 10, design: .monospaced))
                     .foregroundStyle(.secondary)
+                if let currentPath = progress.currentPath {
+                    Text(currentPath)
+                        .font(.system(size: 9))
+                        .foregroundStyle(.tertiary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
             }
             if let failureSummary = progress.failureSummary {
                 Text(failureSummary)
@@ -104,12 +125,6 @@ struct StatusBarView: View {
         }
         .padding(8)
         .background(Color.secondary.opacity(0.08), in: RoundedRectangle(cornerRadius: 6))
-    }
-
-    private func progressFraction(_ progress: EvictionProgress) -> Double {
-        let total = progress.evictedCount + progress.failedCount
-        guard progress.candidateCount > 0 else { return 0 }
-        return min(Double(total) / Double(progress.candidateCount), 1)
     }
 
     // MARK: - Stats
@@ -132,15 +147,47 @@ struct StatusBarView: View {
                         .fill(Color.secondary.opacity(0.15))
                         .frame(height: 4)
                     RoundedRectangle(cornerRadius: 2)
-                        .fill(viewModel.isUnderTarget ? Color.green.opacity(0.7) : Color.orange.opacity(0.8))
-                        .frame(width: geo.size.width * min(targetFraction, 1), height: 4)
+                        .fill(gaugeColor)
+                        .frame(width: geo.size.width * min(gaugeFraction, 1), height: 4)
                 }
             }
             .frame(height: 4)
 
-            Text(viewModel.pollutionLabel)
-                .font(.system(size: 10))
-                .foregroundStyle(.tertiary)
+            HStack {
+                Text(viewModel.pollutionLabel)
+                    .font(.system(size: 10))
+                    .foregroundStyle(.tertiary)
+                Spacer()
+            }
+
+            // Freshness: what the user is looking at and how old it is.
+            if viewModel.status.scanInProgress {
+                HStack(spacing: 4) {
+                    ProgressView()
+                        .controlSize(.mini)
+                    Text("Scanning… \(viewModel.status.scanFilesScanned) files")
+                        .font(.system(size: 9))
+                        .foregroundStyle(.secondary)
+                }
+            } else if let completedAt = viewModel.status.lastScanCompletedAt {
+                TimelineView(.periodic(from: .now, by: 30)) { context in
+                    Text(freshnessLabel(at: context.date, completedAt: completedAt))
+                        .font(.system(size: 9))
+                        .foregroundStyle(.tertiary)
+                }
+            }
+
+            if let cooldown = viewModel.status.cooldownRemainingSeconds, cooldown > 0 {
+                Text("Auto-trim cooldown: \(cooldown / 60)m")
+                    .font(.system(size: 9))
+                    .foregroundStyle(.tertiary)
+            }
+
+            if viewModel.status.fightingCount > 0 {
+                Text("\(viewModel.status.fightingCount) file(s) fighting iCloud re-downloads")
+                    .font(.system(size: 9))
+                    .foregroundStyle(.orange)
+            }
 
             if !viewModel.status.topFolders.isEmpty {
                 VStack(alignment: .leading, spacing: 2) {
@@ -173,10 +220,33 @@ struct StatusBarView: View {
         }
     }
 
-    private var targetFraction: Double {
-        let targetBytes = Int64(configModel.config.policy.targetLocalGiB) * 1024 * 1024 * 1024
-        guard targetBytes > 0 else { return 0 }
-        return Double(viewModel.status.materializedBytes) / Double(targetBytes * 2) // half-bar = at target
+    /// Bar fills toward the trim trigger; color follows policy bands.
+    private var gaugeFraction: Double {
+        let trimBytes = Int64(configModel.config.policy.trimLocalGiB) * 1024 * 1024 * 1024
+        guard trimBytes > 0 else { return 0 }
+        return Double(viewModel.status.materializedBytes) / Double(trimBytes)
+    }
+
+    private var gaugeColor: Color {
+        if viewModel.isCriticalDisk { return .red.opacity(0.8) }
+        if gaugeFraction >= 1 { return .red.opacity(0.8) }
+        if viewModel.isUnderTarget { return .green.opacity(0.7) }
+        return .orange.opacity(0.8)
+    }
+
+    private func freshnessLabel(at now: Date, completedAt: Date) -> String {
+        let age = max(Int(now.timeIntervalSince(completedAt)), 0)
+        let ageText: String
+        if age < 60 {
+            ageText = "just now"
+        } else if age < 3600 {
+            ageText = "\(age / 60)m ago"
+        } else {
+            ageText = "\(age / 3600)h ago"
+        }
+        let duration = viewModel.status.lastScanDuration
+        let durationText = duration > 0 ? String(format: " in %.0fs", duration) : ""
+        return "Updated \(ageText)\(durationText)"
     }
 
     // MARK: - Defense badges
@@ -188,13 +258,16 @@ struct StatusBarView: View {
                     .font(.system(size: 10))
                     .foregroundStyle(.secondary)
             }
-            Label("Watching \(viewModel.status.watchlistCount)", systemImage: "eye.fill")
-                .font(.system(size: 10))
-                .foregroundStyle(.secondary)
+            if viewModel.status.watchlistCount > 0 {
+                Label("Watching \(viewModel.status.watchlistCount)", systemImage: "eye.fill")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.secondary)
+            }
             if viewModel.status.rematerializedTotal > 0 {
                 Label("\(viewModel.status.rematerializedTotal) bounced", systemImage: "arrow.2.circlepath")
                     .font(.system(size: 10))
                     .foregroundStyle(.orange)
+                    .help(viewModel.status.lastRematerializedPath.map { "Latest: \($0)" } ?? "")
             }
             Spacer()
         }
