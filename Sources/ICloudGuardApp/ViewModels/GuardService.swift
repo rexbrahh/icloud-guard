@@ -57,6 +57,7 @@ public enum GuardServiceEvent {
     case rematerialized(paths: [String])
     case fighting(paths: [String])
     case cooldownUpdated(seconds: Int?)
+    case samplesUpdated([GuardSample])
     case pausedChanged(Bool)
     case error(String)
 }
@@ -101,6 +102,9 @@ actor GuardService {
     func start() {
         applySuppression(using: config)
         startWatchlist(using: config)
+        if let state = try? stateStore.load(), !state.samples.isEmpty {
+            eventHandler(.samplesUpdated(state.samples))
+        }
         scheduleScanTimer(intervalSeconds: config.watcher.pollutionCheckIntervalSeconds, fireImmediately: true)
     }
 
@@ -246,6 +250,7 @@ actor GuardService {
                 state.samples + [GuardSample(timestamp: Date(), localBytes: bundle.stats.materializedBytes, freeBytes: bundle.stats.freeBytes)]
             )
             try? stateStore.save(state)
+            eventHandler(.samplesUpdated(state.samples))
 
             let policy = PolicyMapping.corePolicy(from: config).normalized()
             let scan = ScanResult(scopePath: scopePath, freeBytes: bundle.stats.freeBytes, localBytes: bundle.stats.materializedBytes, items: [])

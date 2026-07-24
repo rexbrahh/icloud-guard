@@ -29,6 +29,9 @@ struct GuardStatus: Equatable {
     // Watchlist
     var fightingCount = 0
 
+    // Footprint history (24h of scan samples)
+    var footprintSamples: [GuardSample] = []
+
     // Active run
     var activeRunKind: GuardRunKind?
     var progress: EvictionProgress?
@@ -295,6 +298,9 @@ final class GuardViewModel: ObservableObject {
 
         case .cooldownUpdated(let seconds):
             next.cooldownRemainingSeconds = seconds
+
+        case .samplesUpdated(let samples):
+            next.footprintSamples = samples
 
         case .pausedChanged(let paused):
             next.isPaused = paused

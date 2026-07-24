@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import Charts
 import ICloudGuardCore
 
 struct StatusBarView: View {
@@ -145,7 +146,17 @@ struct StatusBarView: View {
                 ZStack(alignment: .leading) {
                     RoundedRectangle(cornerRadius: 2)
                         .fill(Color.secondary.opacity(0.15))
-                        .frame(height: 4)
+            .frame(height: 4)
+
+            // 24h footprint trend with target line
+            if viewModel.status.footprintSamples.count >= 2 {
+                FootprintChart(
+                    samples: viewModel.status.footprintSamples,
+                    targetBytes: Int64(configModel.config.policy.targetLocalGiB) * 1024 * 1024 * 1024
+                )
+                .frame(height: 34)
+                .padding(.top, 2)
+            }
                     RoundedRectangle(cornerRadius: 2)
                         .fill(gaugeColor)
                         .frame(width: geo.size.width * min(gaugeFraction, 1), height: 4)
@@ -374,5 +385,36 @@ struct StatusBarView: View {
             .font(.system(size: 11))
             .keyboardShortcut("q")
         }
+    }
+}
+
+// MARK: - Footprint sparkline
+
+private struct FootprintChart: View {
+    let samples: [GuardSample]
+    let targetBytes: Int64
+
+    var body: some View {
+        Chart(samples, id: \.timestamp) { sample in
+            AreaMark(
+                x: .value("Time", sample.timestamp),
+                y: .value("Local", sample.localBytes)
+            )
+            .foregroundStyle(Color.blue.opacity(0.18))
+            LineMark(
+                x: .value("Time", sample.timestamp),
+                y: .value("Local", sample.localBytes)
+            )
+            .foregroundStyle(Color.blue.opacity(0.7))
+            .lineStyle(StrokeStyle(lineWidth: 1.5))
+            if targetBytes > 0 {
+                RuleMark(y: .value("Target", targetBytes))
+                    .foregroundStyle(Color.green.opacity(0.6))
+                    .lineStyle(StrokeStyle(lineWidth: 1, dash: [3, 3]))
+            }
+        }
+        .chartXAxis(.hidden)
+        .chartYAxis(.hidden)
+        .chartLegend(.hidden)
     }
 }
