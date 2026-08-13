@@ -58,7 +58,11 @@ extract() {
 }
 
 EXPECTED_KEYS=$'artifact_filename\nartifact_sha256\nartifact_size\nbuild_toolchain\nchannel\ncommit\nexecutable_sha256\nexecutable_uuid\nminimum_macos\nnotarized\nschema_version\nsigning_identity\nsigning_type\nsource_epoch\nsource_tree_clean\nstapled\ntag\nversion'
-ACTUAL_KEYS="$(plutil -extract . raw -o - "$MANIFEST" 2>/dev/null || plutil -p "$MANIFEST" | sed -n 's/^  "\([^"]*\)" =>.*$/\1/p' | LC_ALL=C sort)"
+ACTUAL_KEYS="$(
+    plutil -convert xml1 -o - "$MANIFEST" |
+        sed -n 's/^[[:space:]]*<key>\([^<]*\)<\/key>[[:space:]]*$/\1/p' |
+        LC_ALL=C sort
+)"
 if [[ "$ACTUAL_KEYS" != "$EXPECTED_KEYS" ]]; then
     echo "ERROR: Release manifest keys do not match schema 2." >&2
     exit 1
