@@ -1,6 +1,6 @@
 import Foundation
 import ICloudGuardCore
-import UserNotifications
+@preconcurrency import UserNotifications
 
 /// Actor that manages local notifications with lazy authorization, throttling, and batching.
 ///
