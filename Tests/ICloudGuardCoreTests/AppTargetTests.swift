@@ -3694,7 +3694,7 @@ final class GuardViewModelLifecycleTests: XCTestCase {
             notarized: true,
             stapled: true,
             buildToolchain: "Xcode 16.2",
-            minimumMacOS: "14.0",
+            minimumMacOS: "15.0",
             sourceEpoch: 1,
             provenance: .trustedCI
         )

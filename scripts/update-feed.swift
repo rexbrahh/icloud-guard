@@ -418,7 +418,7 @@ private func validate(_ release: FeedRelease, expectedChannel: Channel, teamID: 
           release.signingType == "developer-id", validSigningIdentity(release.signingIdentity),
           release.teamID == teamID, validTeamID(release.teamID),
           release.notarized, release.stapled,
-          release.minimumMacOS == "14.0",
+          release.minimumMacOS == "15.0",
           !release.buildToolchain.isEmpty, release.buildToolchain.utf8.count <= 256,
           release.provenance == .trustedCI else {
         throw ToolError.invalid("release metadata does not satisfy the installed updater contract")

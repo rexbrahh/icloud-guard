@@ -138,7 +138,7 @@ final class Phase5PolicyBrowserTests: XCTestCase {
         XCTAssertEqual(loaded.scope.keepDownloadedPaths, ["Pinned"])
         XCTAssertEqual(loaded.scope.folderPolicies.map(\.serialized), ["evict-first:Builds"])
         XCTAssertFalse(loaded.notifications.partialFailure)
-        let text = try String(contentsOf: url)
+        let text = try String(contentsOf: url, encoding: .utf8)
         XCTAssertTrue(text.contains("# preserve me"))
         XCTAssertTrue(text.contains("future = \"kept\""))
     }

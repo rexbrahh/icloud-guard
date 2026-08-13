@@ -106,7 +106,7 @@ int main(int argc, char **argv) {
     return 0;
 }
 EOF
-xcrun clang -target arm64-apple-macos14.0 -Wl,-S -DMARKER_PATH="\"$MARKER\"" "$FIXTURE/main.c" -o "$APP/Contents/MacOS/ICloudGuard"
+xcrun clang -target arm64-apple-macos15.0 -Wl,-S -DMARKER_PATH="\"$MARKER\"" "$FIXTURE/main.c" -o "$APP/Contents/MacOS/ICloudGuard"
 cat > "$APP/Contents/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -116,7 +116,7 @@ cat > "$APP/Contents/Info.plist" <<EOF
 <key>CFBundlePackageType</key><string>APPL</string>
 <key>CFBundleShortVersionString</key><string>$VERSION</string>
 <key>CFBundleVersion</key><string>1</string>
-<key>LSMinimumSystemVersion</key><string>14.0</string>
+<key>LSMinimumSystemVersion</key><string>15.0</string>
 </dict></plist>
 EOF
 codesign --force --sign - "$APP"
@@ -148,7 +148,7 @@ write_manifest() {
     plutil -insert notarized -bool false "$MANIFEST"
     plutil -insert stapled -bool false "$MANIFEST"
     plutil -insert build_toolchain -string "release-test" "$MANIFEST"
-    plutil -insert minimum_macos -string 14.0 "$MANIFEST"
+    plutil -insert minimum_macos -string 15.0 "$MANIFEST"
     plutil -insert source_epoch -integer 1700000000 "$MANIFEST"
     plutil -convert json "$MANIFEST"
 }

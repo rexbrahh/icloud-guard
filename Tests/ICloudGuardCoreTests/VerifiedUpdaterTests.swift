@@ -762,7 +762,7 @@ final class VerifiedUpdaterTests: XCTestCase {
             "CFBundleIdentifier": "example.WrongProduct",
             "CFBundlePackageType": "APPL",
             "CFBundleShortVersionString": "0.5.0",
-            "LSMinimumSystemVersion": "14.0",
+            "LSMinimumSystemVersion": "15.0",
         ]
         let infoURL = app.appendingPathComponent("Contents/Info.plist")
         try PropertyListSerialization.data(fromPropertyList: info, format: .xml, options: 0).write(to: infoURL)
@@ -1272,7 +1272,7 @@ private final class Fixture {
             notarized: notarized,
             stapled: stapled,
             buildToolchain: "Apple Swift 6",
-            minimumMacOS: "14.0",
+            minimumMacOS: "15.0",
             sourceEpoch: 900,
             provenance: provenance
         )

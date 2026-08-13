@@ -1998,7 +1998,7 @@ public actor VerifiedReleaseUpdater {
               release.artifactSize > 0,
               release.artifactSize <= configuration.maximumArtifactBytes,
               release.sourceEpoch >= 0,
-              release.minimumMacOS == "14.0",
+              release.minimumMacOS == "15.0",
               !release.buildToolchain.isEmpty,
               release.buildToolchain.utf8.count <= 256,
               URLSessionUpdateTransport.isHTTPS(release.artifactURL),

@@ -252,7 +252,7 @@ plutil -insert signing_type -string "$SIGNING_TYPE" "$MANIFEST_PATH"
 plutil -insert notarized -bool "$NOTARIZED" "$MANIFEST_PATH"
 plutil -insert stapled -bool "$STAPLED" "$MANIFEST_PATH"
 plutil -insert build_toolchain -string "$(xcrun swift --version | head -n 1)" "$MANIFEST_PATH"
-plutil -insert minimum_macos -string "14.0" "$MANIFEST_PATH"
+plutil -insert minimum_macos -string "15.0" "$MANIFEST_PATH"
 plutil -insert source_epoch -integer "$SOURCE_EPOCH" "$MANIFEST_PATH"
 plutil -convert json "$MANIFEST_PATH"
 

@@ -47,7 +47,7 @@ final class UpdateFeedProducerCompatibilityTests: XCTestCase {
             "notarized": true,
             "stapled": true,
             "build_toolchain": "Apple Swift fixture",
-            "minimum_macos": "14.0",
+            "minimum_macos": "15.0",
             "source_epoch": 1_700_000_000,
         ]
         try JSONSerialization.data(withJSONObject: manifestObject, options: [.sortedKeys]).write(to: manifest)

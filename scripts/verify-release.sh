@@ -83,7 +83,7 @@ SOURCE_EPOCH="$(extract source_epoch integer)"
 [[ "$EXPECTED_SIZE" =~ ^[1-9][0-9]*$ && "$SOURCE_EPOCH" =~ ^[0-9]+$ ]] || { echo "ERROR: Release size or source epoch is invalid." >&2; exit 1; }
 [[ "$EXECUTABLE_UUID" =~ ^[0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12}$ ]] || { echo "ERROR: Executable LC_UUID is invalid." >&2; exit 1; }
 [[ -n "$BUILD_TOOLCHAIN" ]] || { echo "ERROR: Build toolchain is empty." >&2; exit 1; }
-[[ "$MINIMUM_MACOS" == "14.0" ]] || { echo "ERROR: Minimum macOS claim is invalid." >&2; exit 1; }
+[[ "$MINIMUM_MACOS" == "15.0" ]] || { echo "ERROR: Minimum macOS claim is invalid." >&2; exit 1; }
 
 SHORT_COMMIT="${COMMIT:0:12}"
 case "$CHANNEL" in

@@ -110,7 +110,7 @@ write_manifest() {
     plutil -insert notarized -bool true "$MANIFEST"
     plutil -insert stapled -bool true "$MANIFEST"
     plutil -insert build_toolchain -string "Apple Swift fixture" "$MANIFEST"
-    plutil -insert minimum_macos -string 14.0 "$MANIFEST"
+    plutil -insert minimum_macos -string 15.0 "$MANIFEST"
     plutil -insert source_epoch -integer 1700000000 "$MANIFEST"
     plutil -convert json "$MANIFEST"
 }

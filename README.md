@@ -77,7 +77,7 @@ what it _can_ do: eliminate the spotlight trigger, eliminate the quicklook trigg
 
 ### requirements
 
-- macos 14+ (sonoma or later — required for `@Environment(\.openSettings)`)
+- macos 15+ (sequoia or later)
 - icloud drive enabled
 - "optimize mac storage" turned on in system settings → apple id → icloud
 
