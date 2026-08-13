@@ -76,6 +76,7 @@ struct StatusBarView: View {
             minWidth: StatusBarLayout.minimumWidth(for: dynamicTypeSize),
             idealWidth: StatusBarLayout.idealWidth(for: dynamicTypeSize),
             maxWidth: 480,
+            minHeight: StatusBarLayout.minimumHeight(for: dynamicTypeSize),
             maxHeight: 700
         )
         .onAppear {
@@ -522,6 +523,10 @@ enum StatusBarLayout {
 
     static func idealWidth(for size: DynamicTypeSize) -> CGFloat {
         size.isAccessibilitySize ? 440 : 340
+    }
+
+    static func minimumHeight(for size: DynamicTypeSize) -> CGFloat {
+        size.isAccessibilitySize ? 420 : 280
     }
 
     static func usesVerticalActions(for size: DynamicTypeSize) -> Bool {

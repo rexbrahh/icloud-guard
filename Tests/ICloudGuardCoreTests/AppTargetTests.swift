@@ -2355,6 +2355,16 @@ final class GuardServiceTests: XCTestCase {
 }
 
 final class StatusBarPresentationTests: XCTestCase {
+    @MainActor
+    func testStatusPopoverHasUsableIntrinsicHeight() {
+        let view = StatusBarView(viewModel: GuardViewModel())
+            .environment(AppConfigModel())
+        let host = NSHostingView(rootView: view)
+
+        XCTAssertGreaterThanOrEqual(host.fittingSize.width, 320)
+        XCTAssertGreaterThanOrEqual(host.fittingSize.height, 280)
+    }
+
     func testStatusAccessibilityNamesIncompleteScanAndUnavailableFreeSpace() {
         var status = GuardStatus()
         status.hasStats = true
@@ -2412,6 +2422,8 @@ final class StatusBarPresentationTests: XCTestCase {
         XCTAssertFalse(StatusBarLayout.usesVerticalRows(for: .large))
         XCTAssertTrue(StatusBarLayout.usesVerticalRows(for: .accessibility1))
         XCTAssertEqual(StatusBarLayout.minimumWidth(for: .accessibility1), 400)
+        XCTAssertEqual(StatusBarLayout.minimumHeight(for: .large), 280)
+        XCTAssertEqual(StatusBarLayout.minimumHeight(for: .accessibility1), 420)
         XCTAssertGreaterThan(
             StatusBarLayout.idealWidth(for: .accessibility1),
             StatusBarLayout.idealWidth(for: .large)
