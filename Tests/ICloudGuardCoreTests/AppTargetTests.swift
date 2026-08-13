@@ -2515,6 +2515,24 @@ private actor AsyncTestGate {
 
 @MainActor
 final class AppConfigModelTests: XCTestCase {
+    func testStartupMigratesValidOlderConfigBeforePresentingIt() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("icloud-guard-config-startup-migration-\(UUID().uuidString)", isDirectory: true)
+        let url = root.appendingPathComponent("config.toml")
+        let store = ConfigStore(configURL: url)
+        try store.save(AppConfig())
+        let older = try String(contentsOf: url, encoding: .utf8)
+            .replacingOccurrences(of: "quicklook = true\n", with: "")
+        try older.write(to: url, atomically: true, encoding: .utf8)
+        XCTAssertTrue(store.inspect().migrationNeeded)
+
+        let model = AppConfigModel(store: store)
+
+        XCTAssertTrue(model.isConfigurationValid)
+        XCTAssertFalse(store.inspect().migrationNeeded)
+        addTeardownBlock { try? FileManager.default.removeItem(at: root) }
+    }
+
     func testScopeSelectorPreservesAllSixtyFourManagedScopes() throws {
         let temporary = FileManager.default.temporaryDirectory
         let physical = temporary.path.hasPrefix("/var/")

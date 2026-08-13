@@ -31,7 +31,10 @@ final class AppConfigModel {
         let resolvedStore = store ?? ConfigStore()
         self.store = resolvedStore
         do {
-            self.config = try resolvedStore.loadValidated()
+            let inspection = resolvedStore.inspect()
+            self.config = try inspection.exists && inspection.valid && inspection.migrationNeeded
+                ? resolvedStore.loadMigratingValidated()
+                : resolvedStore.loadValidated()
             self.isConfigurationValid = true
             self.selectedScopeID = Self.initialScopeID(for: self.config)
         } catch {
