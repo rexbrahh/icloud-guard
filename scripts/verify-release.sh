@@ -5,6 +5,13 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=scripts/shell-helpers.sh
 source "$SCRIPT_DIR/shell-helpers.sh"
 
+report_unexpected_failure() {
+    local status=$?
+    echo "ERROR: Release verifier command failed at line ${BASH_LINENO[0]}." >&2
+    exit "$status"
+}
+trap report_unexpected_failure ERR
+
 EXPECTED_COMMIT=""
 EXPECTED_TAG=""
 EXPECTED_TEAM_ID=""
