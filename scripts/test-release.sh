@@ -50,6 +50,15 @@ expect_failure() {
     fi
 }
 
+capture_success() {
+    local output
+    if ! output="$("$@")"; then
+        printf '%s\n' "$output" >&2
+        return 1
+    fi
+    printf '%s' "$output"
+}
+
 "$TEST_ROOT/repo/scripts/release-gate.sh" --check --channel tip --tag "$TIP_TAG" >/dev/null
 expect_failure "tag mismatch" "$TEST_ROOT/repo/scripts/release-gate.sh" --check --channel tip --tag tip
 touch "$TEST_ROOT/repo/untracked"
@@ -147,7 +156,7 @@ write_manifest() {
 write_manifest
 expect_failure "tip provenance from commit and tag alone" \
     "$TEST_ROOT/repo/scripts/verify-release.sh" --expected-commit "$COMMIT" --expected-tag "$TIP_TAG" "$MANIFEST" "$ARCHIVE"
-INTEGRITY_OUTPUT="$("$TEST_ROOT/repo/scripts/verify-release.sh" \
+INTEGRITY_OUTPUT="$(capture_success "$TEST_ROOT/repo/scripts/verify-release.sh" \
     --expected-commit "$COMMIT" \
     --expected-tag "$TIP_TAG" \
     --allow-unauthenticated-tip \
@@ -162,7 +171,7 @@ expect_failure "independent digest mismatch" \
         --expected-tag "$TIP_TAG" \
         --expected-sha256 "$(printf '0%.0s' {1..64})" \
         "$MANIFEST" "$ARCHIVE"
-VERIFIED_DIGEST_OUTPUT="$("$TEST_ROOT/repo/scripts/verify-release.sh" \
+VERIFIED_DIGEST_OUTPUT="$(capture_success "$TEST_ROOT/repo/scripts/verify-release.sh" \
     --expected-commit "$COMMIT" \
     --expected-tag "$TIP_TAG" \
     --expected-sha256 "$ARCHIVE_SHA" \
