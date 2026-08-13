@@ -4,6 +4,7 @@ import CryptoKit
 import os
 import XCTest
 import SwiftUI
+import AppKit
 @testable import ICloudGuardApp
 @testable import ICloudGuardCore
 
@@ -2457,15 +2458,18 @@ final class StatusBarPresentationTests: XCTestCase {
     }
 
     @MainActor
-    func testSettingsActionOpensWindowBeforeActivatingApplication() {
-        var events: [String] = []
+    func testSettingsWindowFrontingViewOrdersItsExactWindowAfterAttachmentTurn() async {
+        let settings = RecordingOrderFrontWindow()
+        let raised = expectation(description: "settings window raised")
+        settings.onOrderFront = { raised.fulfill() }
+        let content = NSView()
+        settings.contentView = content
 
-        SettingsPresentation.openSettings(
-            open: { events.append("open") },
-            activate: { events.append("activate") }
-        )
+        content.addSubview(SettingsWindowFrontingNSView(frame: .zero))
 
-        XCTAssertEqual(events, ["open", "activate"])
+        XCTAssertFalse(settings.wasOrderedFront)
+        await fulfillment(of: [raised], timeout: 1)
+        XCTAssertTrue(settings.wasOrderedFront)
     }
 
     func testSettingsRowsStackAtAccessibilitySizes() {
@@ -2477,6 +2481,16 @@ final class StatusBarPresentationTests: XCTestCase {
         XCTAssertFalse(SystemIntegrationPolicy.isEnabled(environment: [SystemIntegrationPolicy.disableEnvironmentKey: "1"]))
         XCTAssertTrue(SystemIntegrationPolicy.isEnabled(environment: [SystemIntegrationPolicy.disableEnvironmentKey: "true"]))
         XCTAssertTrue(SystemIntegrationPolicy.isEnabled(environment: [:]))
+    }
+}
+
+private final class RecordingOrderFrontWindow: NSWindow {
+    private(set) var wasOrderedFront = false
+    var onOrderFront: (() -> Void)?
+
+    override func orderFrontRegardless() {
+        wasOrderedFront = true
+        onOrderFront?()
     }
 }
 

@@ -32,6 +32,7 @@ struct SettingsView: View {
             }
         }
         .frame(minWidth: 520, idealWidth: 640, minHeight: 560)
+        .background(SettingsWindowFrontingView())
     }
 
     private var scopeSelection: Binding<String> {
@@ -444,11 +445,23 @@ enum SettingsLayout {
 
 enum SettingsPresentation {
     static let spotlightSuppressionLabel = "Suppress Spotlight indexing"
+}
 
-    @MainActor
-    static func openSettings(open: () -> Void, activate: () -> Void) {
-        open()
-        activate()
+private struct SettingsWindowFrontingView: NSViewRepresentable {
+    func makeNSView(context: Context) -> NSView {
+        SettingsWindowFrontingNSView(frame: .zero)
+    }
+
+    func updateNSView(_ nsView: NSView, context: Context) {}
+}
+
+final class SettingsWindowFrontingNSView: NSView {
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        Task { @MainActor [weak self] in
+            await Task.yield()
+            self?.window?.orderFrontRegardless()
+        }
     }
 }
 

@@ -464,10 +464,7 @@ struct StatusBarView: View {
     private var footerSection: some View {
         HStack {
             Button {
-                SettingsPresentation.openSettings(
-                    open: { openSettings() },
-                    activate: { NSApplication.shared.activate() }
-                )
+                openSettings()
             } label: {
                 Label("Settings", systemImage: "gearshape")
             }
