@@ -1,5 +1,11 @@
 #!/bin/bash
-set -euo pipefail
+set -Eeuo pipefail
+report_error() {
+    local status="$1"
+    printf 'ERROR: test-release failed at line %s: %s\n' "$2" "$3" >&2
+    exit "$status"
+}
+trap 'report_error "$?" "$LINENO" "$BASH_COMMAND"' ERR
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=scripts/shell-helpers.sh
