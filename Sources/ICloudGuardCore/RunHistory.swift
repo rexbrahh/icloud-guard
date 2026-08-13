@@ -567,16 +567,20 @@ public final class RunHistoryStore: Sendable {
         var rows = [columns.map(Self.csvField).joined(separator: ",")]
         for receipt in receipts {
             let reason = privacyMode ? "redacted" : receipt.reason
-            let values = [
+            var values: [String] = [
                 String(receipt.schema), receipt.id, formatter.string(from: receipt.startedAt), formatter.string(from: receipt.endedAt),
                 receipt.trigger.rawValue, receipt.command, receipt.requestedAction, receipt.action.rawValue,
                 String(receipt.dryRun), receipt.status.rawValue, String(receipt.exitCode), reason, receipt.sourceScopeIdentifier,
+            ]
+            values.append(contentsOf: [
                 String(receipt.plannedCount), String(receipt.plannedBytes), String(receipt.verifiedCount), String(receipt.verifiedBytes),
                 String(receipt.pendingCount), String(receipt.pendingBytes), String(receipt.failedCount), String(receipt.failedBytes),
+            ])
+            values.append(contentsOf: [
                 String(receipt.cancelled), String(receipt.preScan?.scanComplete ?? false),
                 String(receipt.preScan?.freeSpaceAvailable ?? false), String(receipt.postScan?.scanComplete ?? false),
                 String(receipt.postScan?.freeSpaceAvailable ?? false), String(receipt.statePersisted), String(receipt.watchlistPersisted),
-            ]
+            ])
             rows.append(values.map { Self.csvField(Self.formulaSafe($0)) }.joined(separator: ","))
         }
         try Self.atomicWrite(Data((rows.joined(separator: "\r\n") + "\r\n").utf8), to: outputURL)
