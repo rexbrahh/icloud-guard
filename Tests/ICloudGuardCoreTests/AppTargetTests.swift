@@ -2456,6 +2456,18 @@ final class StatusBarPresentationTests: XCTestCase {
         XCTAssertEqual(SettingsPresentation.spotlightSuppressionLabel, "Suppress Spotlight indexing")
     }
 
+    @MainActor
+    func testSettingsActionOpensWindowBeforeActivatingApplication() {
+        var events: [String] = []
+
+        SettingsPresentation.openSettings(
+            open: { events.append("open") },
+            activate: { events.append("activate") }
+        )
+
+        XCTAssertEqual(events, ["open", "activate"])
+    }
+
     func testSettingsRowsStackAtAccessibilitySizes() {
         XCTAssertFalse(SettingsLayout.usesVerticalRows(for: .large))
         XCTAssertTrue(SettingsLayout.usesVerticalRows(for: .accessibility1))

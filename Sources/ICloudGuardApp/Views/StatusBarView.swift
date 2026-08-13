@@ -7,6 +7,7 @@ struct StatusBarView: View {
     @ObservedObject var viewModel: GuardViewModel
     @Environment(AppConfigModel.self) private var configModel
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+    @Environment(\.openSettings) private var openSettings
     @State private var showPanicConfirm = false
 
     var body: some View {
@@ -462,7 +463,12 @@ struct StatusBarView: View {
 
     private var footerSection: some View {
         HStack {
-            SettingsLink {
+            Button {
+                SettingsPresentation.openSettings(
+                    open: { openSettings() },
+                    activate: { NSApplication.shared.activate() }
+                )
+            } label: {
                 Label("Settings", systemImage: "gearshape")
             }
             .buttonStyle(.borderless)

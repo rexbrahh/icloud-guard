@@ -444,6 +444,12 @@ enum SettingsLayout {
 
 enum SettingsPresentation {
     static let spotlightSuppressionLabel = "Suppress Spotlight indexing"
+
+    @MainActor
+    static func openSettings(open: () -> Void, activate: () -> Void) {
+        open()
+        activate()
+    }
 }
 
 private struct AboutView: View {
