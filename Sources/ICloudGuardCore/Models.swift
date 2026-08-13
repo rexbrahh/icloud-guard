@@ -49,6 +49,8 @@ public struct PolicyConfig: Codable, Equatable, Sendable {
     public var growthWindowMinutes: Int
     public var cooldownMinutes: Int
     public var protectedPaths: [String]
+    public var keepDownloadedPaths: [String]
+    public var folderPolicies: [FolderPolicyRule]
 
     public init(
         sampleIntervalSeconds: Int,
@@ -60,7 +62,9 @@ public struct PolicyConfig: Codable, Equatable, Sendable {
         growthTriggerGiB: Int,
         growthWindowMinutes: Int,
         cooldownMinutes: Int,
-        protectedPaths: [String]
+        protectedPaths: [String],
+        keepDownloadedPaths: [String] = [],
+        folderPolicies: [FolderPolicyRule] = []
     ) {
         self.sampleIntervalSeconds = sampleIntervalSeconds
         self.targetLocalGiB = targetLocalGiB
@@ -72,6 +76,8 @@ public struct PolicyConfig: Codable, Equatable, Sendable {
         self.growthWindowMinutes = growthWindowMinutes
         self.cooldownMinutes = cooldownMinutes
         self.protectedPaths = protectedPaths
+        self.keepDownloadedPaths = keepDownloadedPaths
+        self.folderPolicies = folderPolicies
     }
 
     public var targetLocalBytes: Int64 { Int64(targetLocalGiB) * bytesPerGiB }
@@ -97,7 +103,9 @@ public struct PolicyConfig: Codable, Equatable, Sendable {
             growthTriggerGiB: max(growthTriggerGiB, 0),
             growthWindowMinutes: max(growthWindowMinutes, 1),
             cooldownMinutes: max(cooldownMinutes, 0),
-            protectedPaths: protectedPaths
+            protectedPaths: protectedPaths,
+            keepDownloadedPaths: keepDownloadedPaths,
+            folderPolicies: folderPolicies
         )
     }
 }
@@ -131,10 +139,13 @@ public struct GuardRunSummary: Codable, Equatable, Sendable {
     public var dryRun: Bool
     public var candidateCount: Int
     public var evictedCount: Int
+    public var pendingEvictionCount: Int
     public var failedEvictionCount: Int
     public var reclaimedBytes: Int64
     public var remainingLocalBytes: Int64
     public var remainingFreeBytes: Int64
+    public var postScanComplete: Bool
+    public var freeSpaceAvailable: Bool
     public var escalatedToPanic: Bool
 
     private enum CodingKeys: String, CodingKey {
@@ -144,10 +155,13 @@ public struct GuardRunSummary: Codable, Equatable, Sendable {
         case dryRun
         case candidateCount
         case evictedCount
+        case pendingEvictionCount
         case failedEvictionCount
         case reclaimedBytes
         case remainingLocalBytes
         case remainingFreeBytes
+        case postScanComplete
+        case freeSpaceAvailable
         case escalatedToPanic
     }
 
@@ -158,10 +172,13 @@ public struct GuardRunSummary: Codable, Equatable, Sendable {
         dryRun: Bool,
         candidateCount: Int,
         evictedCount: Int,
+        pendingEvictionCount: Int = 0,
         failedEvictionCount: Int,
         reclaimedBytes: Int64,
         remainingLocalBytes: Int64,
         remainingFreeBytes: Int64,
+        postScanComplete: Bool = false,
+        freeSpaceAvailable: Bool = false,
         escalatedToPanic: Bool
     ) {
         self.timestamp = timestamp
@@ -170,10 +187,13 @@ public struct GuardRunSummary: Codable, Equatable, Sendable {
         self.dryRun = dryRun
         self.candidateCount = candidateCount
         self.evictedCount = evictedCount
+        self.pendingEvictionCount = pendingEvictionCount
         self.failedEvictionCount = failedEvictionCount
         self.reclaimedBytes = reclaimedBytes
         self.remainingLocalBytes = remainingLocalBytes
         self.remainingFreeBytes = remainingFreeBytes
+        self.postScanComplete = postScanComplete
+        self.freeSpaceAvailable = freeSpaceAvailable
         self.escalatedToPanic = escalatedToPanic
     }
 
@@ -186,10 +206,13 @@ public struct GuardRunSummary: Codable, Equatable, Sendable {
         self.dryRun = try container.decode(Bool.self, forKey: .dryRun)
         self.candidateCount = try container.decode(Int.self, forKey: .candidateCount)
         self.evictedCount = try container.decode(Int.self, forKey: .evictedCount)
+        self.pendingEvictionCount = try container.decodeIfPresent(Int.self, forKey: .pendingEvictionCount) ?? 0
         self.failedEvictionCount = try container.decodeIfPresent(Int.self, forKey: .failedEvictionCount) ?? 0
         self.reclaimedBytes = try container.decode(Int64.self, forKey: .reclaimedBytes)
         self.remainingLocalBytes = try container.decode(Int64.self, forKey: .remainingLocalBytes)
         self.remainingFreeBytes = try container.decode(Int64.self, forKey: .remainingFreeBytes)
+        self.postScanComplete = try container.decodeIfPresent(Bool.self, forKey: .postScanComplete) ?? false
+        self.freeSpaceAvailable = try container.decodeIfPresent(Bool.self, forKey: .freeSpaceAvailable) ?? false
         self.escalatedToPanic = try container.decodeIfPresent(Bool.self, forKey: .escalatedToPanic) ?? false
     }
 }
@@ -347,12 +370,23 @@ public struct ScanResult: Codable, Equatable, Sendable {
     public var freeBytes: Int64
     public var localBytes: Int64
     public var items: [ICloudItemSnapshot]
+    public var freeSpaceAvailable: Bool
+    public var scanComplete: Bool
 
-    public init(scopePath: String, freeBytes: Int64, localBytes: Int64, items: [ICloudItemSnapshot]) {
+    public init(
+        scopePath: String,
+        freeBytes: Int64,
+        localBytes: Int64,
+        items: [ICloudItemSnapshot],
+        freeSpaceAvailable: Bool = true,
+        scanComplete: Bool = true
+    ) {
         self.scopePath = scopePath
         self.freeBytes = freeBytes
         self.localBytes = localBytes
         self.items = items
+        self.freeSpaceAvailable = freeSpaceAvailable
+        self.scanComplete = scanComplete
     }
 }
 

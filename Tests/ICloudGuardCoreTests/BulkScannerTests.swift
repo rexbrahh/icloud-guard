@@ -38,7 +38,7 @@ final class BulkScannerTests: XCTestCase {
         XCTAssertEqual(b.logicalBytes, 8192)
     }
 
-    func testScanSkipsHiddenFilesAndReportsDirectories() throws {
+    func testScanIncludesHiddenFilesAndReportsDirectories() throws {
         try Data(repeating: 0x41, count: 128).write(to: tempDir.appendingPathComponent(".hidden"))
         try Data(repeating: 0x41, count: 128).write(to: tempDir.appendingPathComponent("visible"))
         let sub = tempDir.appendingPathComponent("SubDir", isDirectory: true)
@@ -47,7 +47,7 @@ final class BulkScannerTests: XCTestCase {
         var entries: [BulkScanEntry] = []
         try BulkScanner.scan(rootPath: tempDir.path) { entries.append($0) }
 
-        XCTAssertEqual(entries.filter { $0.isRegularFile }.count, 1)
+        XCTAssertEqual(entries.filter { $0.isRegularFile }.map(\.relativePath).sorted(), [".hidden", "visible"])
         XCTAssertEqual(entries.filter { $0.isDirectory }.map(\.relativePath), ["SubDir"])
     }
 
@@ -66,16 +66,64 @@ final class BulkScannerTests: XCTestCase {
         XCTAssertEqual(files.map(\.relativePath), ["target.txt"])
     }
 
+    func testRootSymlinkIsResolvedOnceWithoutFollowingDescendantSymlinks() throws {
+        let realRoot = tempDir.appendingPathComponent("real", isDirectory: true)
+        try FileManager.default.createDirectory(at: realRoot, withIntermediateDirectories: true)
+        try Data("inside".utf8).write(to: realRoot.appendingPathComponent("inside.txt"))
+        let rootLink = tempDir.appendingPathComponent("root-link", isDirectory: true)
+        try FileManager.default.createSymbolicLink(at: rootLink, withDestinationURL: realRoot)
+
+        var entries: [BulkScanEntry] = []
+        let summary = try BulkScanner.scan(rootPath: rootLink.path) { entries.append($0) }
+
+        XCTAssertTrue(summary.isComplete)
+        XCTAssertEqual(entries.filter(\.isRegularFile).map(\.relativePath), ["inside.txt"])
+    }
+
+    func testCancelledCandidateCollectionReturnsIncompleteBundle() throws {
+        try Data(repeating: 0x41, count: 4096).write(to: tempDir.appendingPathComponent("resident.bin"))
+        let cancellation = EvictionCancellation()
+        cancellation.cancel()
+        let engine = EvictionEngine(logger: BulkTestLogger())
+
+        let bundle = try engine.collectScanBundle(
+            scopePath: tempDir.path,
+            protectedPaths: ProtectedPathsMatcher(patterns: []),
+            cancellation: cancellation
+        )
+
+        XCTAssertFalse(bundle.stats.scanComplete)
+        XCTAssertTrue(bundle.candidates.isEmpty)
+    }
+
     func testScanRespectsShouldStop() throws {
         for index in 0..<10 {
             try Data(repeating: 0x41, count: 128).write(to: tempDir.appendingPathComponent("f\(index).txt"))
         }
 
         var count = 0
-        try BulkScanner.scan(rootPath: tempDir.path, shouldStop: { true }) { _ in count += 1 }
+        let summary = try BulkScanner.scan(rootPath: tempDir.path, shouldStop: { true }) { _ in count += 1 }
         // Stop is checked between directories: the root directory is scanned
         // before the first check in some orderings, so tolerate either early exit.
         XCTAssertLessThanOrEqual(count, 10)
+        XCTAssertTrue(summary.stoppedEarly)
+        XCTAssertFalse(summary.isComplete)
+    }
+
+    func testCancellationDuringRootBatchMarksScanIncomplete() throws {
+        for index in 0..<10 {
+            try Data(repeating: 0x41, count: 128).write(to: tempDir.appendingPathComponent("f\(index).txt"))
+        }
+        var shouldStop = false
+        let summary = try BulkScanner.scan(
+            rootPath: tempDir.path,
+            shouldStop: { shouldStop }
+        ) { _ in
+            shouldStop = true
+        }
+
+        XCTAssertTrue(summary.stoppedEarly)
+        XCTAssertFalse(summary.isComplete)
     }
 
     func testScanThrowsForMissingRoot() {
@@ -83,6 +131,67 @@ final class BulkScannerTests: XCTestCase {
             XCTAssertTrue(String(describing: error).contains("cannot open scan root"))
         }
     }
+
+    func testProtectedDatalessPackageChildBlocksResidentPackageCandidate() throws {
+        let packagePath = "/scope/Mixed.app"
+        let entries = [
+            BulkScanEntry(
+                path: packagePath,
+                relativePath: "Mixed.app",
+                isDirectory: true,
+                isRegularFile: false,
+                isDataless: false,
+                allocatedBytes: 0,
+                logicalBytes: 0,
+                modificationDate: nil
+            ),
+            BulkScanEntry(
+                path: "\(packagePath)/Protected.placeholder",
+                relativePath: "Mixed.app/Protected.placeholder",
+                isDirectory: false,
+                isRegularFile: true,
+                isDataless: true,
+                allocatedBytes: 0,
+                logicalBytes: 100,
+                modificationDate: nil
+            ),
+            BulkScanEntry(
+                path: "\(packagePath)/resident.bin",
+                relativePath: "Mixed.app/resident.bin",
+                isDirectory: false,
+                isRegularFile: true,
+                isDataless: false,
+                allocatedBytes: 4_096,
+                logicalBytes: 4_096,
+                modificationDate: nil
+            ),
+        ]
+
+        let bundle = try ScanOrchestrator.scan(
+            scopePath: "/scope",
+            protectedPaths: ProtectedPathsMatcher(patterns: ["Mixed.app/Protected.placeholder"]),
+            bulkScan: { _, _, onEntry in
+                entries.forEach(onEntry)
+                var summary = BulkScanSummary()
+                summary.scannedEntries = entries.count
+                return summary
+            },
+            isFilePackage: { $0 == packagePath },
+            freeDiskBytes: { _ in 1_000_000 }
+        )
+
+        XCTAssertTrue(bundle.stats.scanComplete)
+        XCTAssertEqual(bundle.stats.datalessFiles, 1)
+        XCTAssertEqual(bundle.stats.materializedFiles, 1)
+        XCTAssertTrue(bundle.candidates.isEmpty)
+        XCTAssertEqual(bundle.exclusions[.protected], 1)
+        XCTAssertEqual(bundle.exclusions[.package], 1)
+        XCTAssertNil(bundle.exclusions[.dataless])
+    }
+}
+
+private final class BulkTestLogger: GuardLogging {
+    func log(_ message: String) {}
 }
 
 final class DriveStatsTests: XCTestCase {
@@ -134,6 +243,16 @@ final class DriveStatsTests: XCTestCase {
         let stats = try DriveStatsCollector.collect(scopePath: tempDir.path)
         XCTAssertEqual(stats.materializedRatio, 0)
         XCTAssertEqual(stats.totalFiles, 0)
+    }
+
+    func testHiddenAndZeroByteFilesAreCountedAsMaterialized() throws {
+        try Data().write(to: tempDir.appendingPathComponent(".empty"))
+        let stats = try DriveStatsCollector.collect(scopePath: tempDir.path)
+
+        XCTAssertEqual(stats.materializedFiles, 1)
+        XCTAssertEqual(stats.materializedBytes, 0)
+        XCTAssertTrue(stats.scanComplete)
+        XCTAssertTrue(stats.freeSpaceAvailable)
     }
 }
 

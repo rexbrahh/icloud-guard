@@ -20,6 +20,7 @@ public struct BulkScanEntry: Equatable, Sendable {
     /// Logical file size (0 when unknown for dataless files).
     public let logicalBytes: Int64
     public let modificationDate: Date?
+    public let identity: EvictionFileIdentity?
 
     public init(
         path: String,
@@ -29,7 +30,8 @@ public struct BulkScanEntry: Equatable, Sendable {
         isDataless: Bool,
         allocatedBytes: Int64,
         logicalBytes: Int64,
-        modificationDate: Date?
+        modificationDate: Date?,
+        identity: EvictionFileIdentity? = nil
     ) {
         self.path = path
         self.relativePath = relativePath
@@ -39,11 +41,27 @@ public struct BulkScanEntry: Equatable, Sendable {
         self.allocatedBytes = allocatedBytes
         self.logicalBytes = logicalBytes
         self.modificationDate = modificationDate
+        self.identity = identity
     }
 
     /// True when the file occupies local disk space and can be evicted.
     public var isLocallyResidentFile: Bool {
         isRegularFile && !isDataless && allocatedBytes > 0
+    }
+}
+
+/// Completeness metadata for a bulk scan. Callers must not treat a partial
+/// walk as a complete view of the scope.
+public struct BulkScanSummary: Equatable, Sendable {
+    public var scannedEntries: Int = 0
+    public var skippedDirectories: Int = 0
+    public var readErrors: Int = 0
+    public var stoppedEarly: Bool = false
+
+    public init() {}
+
+    public var isComplete: Bool {
+        !stoppedEarly && skippedDirectories == 0 && readErrors == 0
     }
 }
 
@@ -59,6 +77,10 @@ public struct BulkScanEntry: Equatable, Sendable {
 /// for per-file `URL.resourceValues` round trips. Falls back to a plain
 /// `lstat(2)` directory walk if the bulk call is unsupported.
 public enum BulkScanner {
+    private final class ScanAccumulator {
+        var summary = BulkScanSummary()
+    }
+
     public enum ScanError: Error, CustomStringConvertible {
         case cannotOpenRoot(String)
 
@@ -70,36 +92,47 @@ public enum BulkScanner {
     }
 
     /// Recursively scan `rootPath`, invoking `onEntry` for every regular file
-    /// and directory (hidden entries skipped, symlinks not followed).
+    /// and directory (including hidden entries; symlinks are not followed).
     ///
     /// - Parameters:
     ///   - rootPath: absolute path (supports ~).
     ///   - shouldStop: checked between directories; return true to abort early.
     ///   - onEntry: called on the current thread for each entry.
+    @discardableResult
     public static func scan(
         rootPath: String,
         shouldStop: () -> Bool = { false },
         onEntry: (BulkScanEntry) -> Void
-    ) throws {
+    ) throws -> BulkScanSummary {
         let expandedRoot = NSString(string: rootPath).expandingTildeInPath
         let rootURL = URL(fileURLWithPath: expandedRoot, isDirectory: true)
-        let standardizedRoot = rootURL.standardizedFileURL.path
-        let rootComponentCount = rootURL.standardizedFileURL.pathComponents.count
+        let standardizedRoot = rootURL.resolvingSymlinksInPath().standardizedFileURL.path
+        let rootComponentCount = URL(fileURLWithPath: standardizedRoot).pathComponents.count
 
         var pendingDirectories: [String] = [standardizedRoot]
         var buffer = [UInt8](repeating: 0, count: bufferSize)
+        let accumulator = ScanAccumulator()
 
         while let directoryPath = pendingDirectories.popLast() {
-            if shouldStop() { return }
+            if shouldStop() {
+                accumulator.summary.stoppedEarly = true
+                break
+            }
             try scanDirectory(
                 at: directoryPath,
                 rootComponentCount: rootComponentCount,
                 buffer: &buffer,
                 isRoot: directoryPath == standardizedRoot,
-                onEntry: onEntry,
-                onSubdirectory: { pendingDirectories.append($0) }
+                shouldStop: shouldStop,
+                onEntry: {
+                    accumulator.summary.scannedEntries += 1
+                    onEntry($0)
+                },
+                onSubdirectory: { pendingDirectories.append($0) },
+                accumulator: accumulator
             )
         }
+        return accumulator.summary
     }
 
     // MARK: - Directory scanning
@@ -109,15 +142,26 @@ public enum BulkScanner {
         rootComponentCount: Int,
         buffer: inout [UInt8],
         isRoot: Bool,
+        shouldStop: () -> Bool,
         onEntry: (BulkScanEntry) -> Void,
-        onSubdirectory: (String) -> Void
+        onSubdirectory: (String) -> Void,
+        accumulator: ScanAccumulator
     ) throws {
-        let fd = path.withCString { Darwin.open($0, O_RDONLY | O_DIRECTORY, 0) }
+        // Never follow a directory that was replaced with a symlink between
+        // discovery and traversal. The root is resolved once above; every
+        // queued descendant must still be the directory we discovered.
+        let fd = path.withCString { Darwin.open($0, O_RDONLY | O_DIRECTORY | O_NOFOLLOW, 0) }
         guard fd >= 0 else {
             if isRoot { throw ScanError.cannotOpenRoot(path) }
-            return // unreadable subdirectory — skip
+            accumulator.summary.skippedDirectories += 1
+            return
         }
         defer { close(fd) }
+        guard openedDirectory(fd: fd, matchesPath: path) else {
+            if isRoot { throw ScanError.cannotOpenRoot(path) }
+            accumulator.summary.skippedDirectories += 1
+            return
+        }
 
         var attributes = attrlist()
         attributes.bitmapcount = UInt16(attrBitMapCount)
@@ -126,6 +170,10 @@ public enum BulkScanner {
         var usedBulk = false
 
         while true {
+            if shouldStop() {
+                accumulator.summary.stoppedEarly = true
+                return
+            }
             let recordCount = buffer.withUnsafeMutableBytes { rawBuffer -> Int32 in
                 guard let bufferAddress = rawBuffer.baseAddress else { return -1 }
                 return bulkListDirectory(
@@ -140,16 +188,23 @@ public enum BulkScanner {
                 let errorNumber = errno
                 if !usedBulk {
                     // Bulk unsupported here — fall back to lstat walk once.
-                    fallbackScanDirectory(
-                        at: path,
+                    if !fallbackScanDirectory(
+                        directoryFD: fd,
+                        path: path,
                         rootComponentCount: rootComponentCount,
+                        shouldStop: shouldStop,
                         onEntry: onEntry,
-                        onSubdirectory: onSubdirectory
-                    )
+                        onSubdirectory: onSubdirectory,
+                        onReadError: { accumulator.summary.readErrors += 1 },
+                        onStopped: { accumulator.summary.stoppedEarly = true }
+                    ) {
+                        accumulator.summary.skippedDirectories += 1
+                    }
                     return
                 }
                 if errorNumber == EINTR { continue }
-                return // mid-scan error — skip rest of this directory
+                accumulator.summary.readErrors += 1
+                return
             }
 
             if recordCount == 0 { return } // directory exhausted
@@ -157,14 +212,18 @@ public enum BulkScanner {
 
             buffer.withUnsafeBytes { rawBuffer in
                 guard let baseAddress = rawBuffer.baseAddress else { return }
-                parseRecords(
+                if !parseRecords(
                     baseAddress: baseAddress,
                     recordCount: Int(recordCount),
+                    directoryFD: fd,
                     directoryPath: path,
                     rootComponentCount: rootComponentCount,
                     onEntry: onEntry,
-                    onSubdirectory: onSubdirectory
-                )
+                    onSubdirectory: onSubdirectory,
+                    onReadError: { accumulator.summary.readErrors += 1 }
+                ) {
+                    accumulator.summary.readErrors += 1
+                }
             }
         }
     }
@@ -174,17 +233,19 @@ public enum BulkScanner {
     private static func parseRecords(
         baseAddress: UnsafeRawPointer,
         recordCount: Int,
+        directoryFD: Int32,
         directoryPath: String,
         rootComponentCount: Int,
         onEntry: (BulkScanEntry) -> Void,
-        onSubdirectory: (String) -> Void
-    ) {
+        onSubdirectory: (String) -> Void,
+        onReadError: () -> Void
+    ) -> Bool {
         var cursor = baseAddress
 
         for _ in 0..<recordCount {
             let recordStart = cursor
             let recordLength = Int(readUInt32(from: recordStart, at: 0))
-            guard recordLength >= 24 else { break }
+            guard recordLength >= 24 else { return false }
 
             let returnedCommon = readUInt32(from: recordStart, at: 4)
 
@@ -192,7 +253,6 @@ public enum BulkScanner {
 
             var name: String?
             var objectType: UInt32 = 0
-            var flags: UInt32 = 0
 
             // Common attributes are returned in ascending bit order:
             // NAME (0x1) < OBJTYPE (0x8) < FLAGS (0x40000)
@@ -206,14 +266,20 @@ public enum BulkScanner {
                 field += 4
             }
             if returnedCommon & attrCMFlags != 0 {
-                flags = readUInt32(from: field, at: 0)
+                _ = readUInt32(from: field, at: 0)
                 field += 4
             }
 
-            if let entryName = name, entryName != ".", entryName != "..", !entryName.hasPrefix(".") {
+            if let entryName = name, entryName != ".", entryName != ".." {
                 let entryPath = directoryPath == "/" ? "/\(entryName)" : "\(directoryPath)/\(entryName)"
 
                 if objectType == vDir {
+                    guard let statInfo = lstatAt(directoryFD: directoryFD, name: entryName),
+                          statInfo.st_mode & S_IFMT == S_IFDIR else {
+                        onReadError()
+                        cursor = recordStart + recordLength
+                        continue
+                    }
                     onSubdirectory(entryPath)
                     onEntry(BulkScanEntry(
                         path: entryPath,
@@ -223,20 +289,23 @@ public enum BulkScanner {
                         isDataless: false,
                         allocatedBytes: 0,
                         logicalBytes: 0,
-                        modificationDate: nil
+                        modificationDate: Date(timeIntervalSince1970: TimeInterval(statInfo.st_mtimespec.tv_sec)),
+                        identity: EvictionFileIdentity.from(statInfo)
                     ))
                 } else if objectType == vReg {
-                    let isDataless = (flags & sfDataless) != 0
-                    // FileProvider trees do not vend ATTR_FILE_* sizes; lstat
-                    // only materialized files to learn their footprint.
-                    var allocatedBytes: Int64 = 0
-                    var logicalBytes: Int64 = 0
-                    var modificationDate: Date?
-                    if !isDataless, let statInfo = lstatPath(entryPath) {
-                        allocatedBytes = Int64(statInfo.st_blocks) * 512
-                        logicalBytes = Int64(statInfo.st_size)
-                        modificationDate = Date(timeIntervalSince1970: TimeInterval(statInfo.st_mtimespec.tv_sec))
+                    // The bulk record can become stale before parsing. Re-read
+                    // the entry without following links and only accept the
+                    // regular-file type observed at this boundary.
+                    guard let statInfo = lstatAt(directoryFD: directoryFD, name: entryName),
+                          statInfo.st_mode & S_IFMT == S_IFREG else {
+                        onReadError()
+                        cursor = recordStart + recordLength
+                        continue
                     }
+                    let isDataless = (statInfo.st_flags & sfDataless) != 0
+                    let allocatedBytes = Int64(statInfo.st_blocks) * 512
+                    let logicalBytes = Int64(statInfo.st_size)
+                    let modificationDate = Date(timeIntervalSince1970: TimeInterval(statInfo.st_mtimespec.tv_sec))
                     onEntry(BulkScanEntry(
                         path: entryPath,
                         relativePath: makeRelativePath(fullPath: entryPath, rootComponentCount: rootComponentCount),
@@ -245,7 +314,8 @@ public enum BulkScanner {
                         isDataless: isDataless,
                         allocatedBytes: allocatedBytes,
                         logicalBytes: logicalBytes,
-                        modificationDate: modificationDate
+                        modificationDate: modificationDate,
+                        identity: EvictionFileIdentity.from(statInfo)
                     ))
                 }
                 // symlinks, sockets, fifos — skipped entirely
@@ -253,30 +323,52 @@ public enum BulkScanner {
 
             cursor = recordStart + recordLength
         }
+        return true
     }
 
     // MARK: - lstat fallback
 
     private static func fallbackScanDirectory(
-        at path: String,
+        directoryFD: Int32,
+        path: String,
         rootComponentCount: Int,
+        shouldStop: () -> Bool,
         onEntry: (BulkScanEntry) -> Void,
-        onSubdirectory: (String) -> Void
-    ) {
-        guard let directory = opendir(path) else { return }
+        onSubdirectory: (String) -> Void,
+        onReadError: () -> Void,
+        onStopped: () -> Void
+    ) -> Bool {
+        let duplicatedFD = dup(directoryFD)
+        guard duplicatedFD >= 0 else { return false }
+        guard let directory = fdopendir(duplicatedFD) else {
+            close(duplicatedFD)
+            return false
+        }
         defer { closedir(directory) }
 
-        while let entryPointer = readdir(directory) {
+        while true {
+            errno = 0
+            guard let entryPointer = readdir(directory) else {
+                if errno != 0 { onReadError() }
+                break
+            }
+            if shouldStop() {
+                onStopped()
+                return true
+            }
             let entry = entryPointer.pointee
             let name = withUnsafePointer(to: entry.d_name) { namePointer in
                 namePointer.withMemoryRebound(to: CChar.self, capacity: Int(entry.d_namlen) + 1) {
                     String(cString: $0)
                 }
             }
-            if name == "." || name == ".." || name.hasPrefix(".") { continue }
+            if name == "." || name == ".." { continue }
 
             let childPath = path == "/" ? "/\(name)" : "\(path)/\(name)"
-            guard let statInfo = lstatPath(childPath) else { continue }
+            guard let statInfo = lstatAt(directoryFD: directoryFD, name: name) else {
+                onReadError()
+                continue
+            }
 
             let fileType = statInfo.st_mode & S_IFMT
             let relativePath = makeRelativePath(fullPath: childPath, rootComponentCount: rootComponentCount)
@@ -292,7 +384,8 @@ public enum BulkScanner {
                     isDataless: false,
                     allocatedBytes: 0,
                     logicalBytes: 0,
-                    modificationDate: modificationDate
+                    modificationDate: modificationDate,
+                    identity: EvictionFileIdentity.from(statInfo)
                 ))
             } else if fileType == S_IFREG {
                 onEntry(BulkScanEntry(
@@ -303,10 +396,12 @@ public enum BulkScanner {
                     isDataless: (statInfo.st_flags & sfDataless) != 0,
                     allocatedBytes: Int64(statInfo.st_blocks) * 512,
                     logicalBytes: Int64(statInfo.st_size),
-                    modificationDate: modificationDate
+                    modificationDate: modificationDate,
+                    identity: EvictionFileIdentity.from(statInfo)
                 ))
             }
         }
+        return true
     }
 
     // MARK: - Helpers
@@ -315,6 +410,21 @@ public enum BulkScanner {
         var statInfo = stat()
         guard path.withCString({ lstat($0, &statInfo) }) == 0 else { return nil }
         return statInfo
+    }
+
+    private static func lstatAt(directoryFD: Int32, name: String) -> stat? {
+        var statInfo = stat()
+        let result = name.withCString {
+            fstatat(directoryFD, $0, &statInfo, AT_SYMLINK_NOFOLLOW)
+        }
+        return result == 0 ? statInfo : nil
+    }
+
+    private static func openedDirectory(fd: Int32, matchesPath expectedPath: String) -> Bool {
+        var buffer = [CChar](repeating: 0, count: Int(PATH_MAX))
+        guard fcntl(fd, F_GETPATH, &buffer) == 0 else { return false }
+        let openedPath = URL(fileURLWithPath: String(cString: buffer)).standardizedFileURL.path
+        return openedPath == URL(fileURLWithPath: expectedPath).standardizedFileURL.path
     }
 
     private static func makeRelativePath(fullPath: String, rootComponentCount: Int) -> String {

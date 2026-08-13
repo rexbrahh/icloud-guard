@@ -8,16 +8,47 @@ import Foundation
 /// - glob patterns containing `*` or `?` matched against the full path and the file name
 public struct ProtectedPathsMatcher: Sendable {
     public let patterns: [String]
+    public let keepDownloaded: KeepDownloadedMatcher
+    public let folderPolicies: FolderPolicySet
 
     public init(patterns: [String]) {
-        self.patterns = patterns
-            .map { $0.trimmingCharacters(in: .whitespaces) }
-            .filter { !$0.isEmpty }
+        self.init(protectedPaths: patterns, keepDownloadedPatterns: [], folderPolicies: [])
     }
 
-    public var isEmpty: Bool { patterns.isEmpty }
+    public init(
+        protectedPaths: [String],
+        keepDownloadedPatterns: [String],
+        folderPolicies: [FolderPolicyRule]
+    ) {
+        self.patterns = protectedPaths
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+        self.keepDownloaded = KeepDownloadedMatcher(patterns: keepDownloadedPatterns)
+        self.folderPolicies = FolderPolicySet(folderPolicies)
+    }
+
+    public var isEmpty: Bool { patterns.isEmpty && keepDownloaded.isEmpty && folderPolicies.rules.isEmpty }
+
+    public func folderMode(relativePath: String) -> FolderPolicyMode? {
+        folderPolicies.effectiveMode(relativePath: relativePath)
+    }
+
+    public func priorityRank(relativePath: String) -> Int {
+        folderPolicies.rank(for: relativePath)
+    }
+
+    public func isKeptDownloaded(relativePath: String) -> Bool {
+        keepDownloaded.matches(relativePath: relativePath)
+    }
 
     public func isProtected(path: String, relativePath: String) -> Bool {
+        if patternsMatch(path: path, relativePath: relativePath) { return true }
+        let relative = relativePath.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        if keepDownloaded.matches(relativePath: relative) { return true }
+        return folderPolicies.effectiveMode(relativePath: relative) == .protect
+    }
+
+    public func patternsMatch(path: String, relativePath: String) -> Bool {
         let expanded = path
         let relative = relativePath.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
 

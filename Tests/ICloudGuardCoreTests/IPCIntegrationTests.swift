@@ -1,5 +1,6 @@
 import Foundation
 import Darwin
+import os
 import XCTest
 @testable import ICloudGuardCore
 
@@ -19,8 +20,8 @@ final class IPCIntegrationTests: XCTestCase {
 
     override func setUp() {
         super.setUp()
-        tempDir = FileManager.default.temporaryDirectory
-            .appendingPathComponent("IPCIntegrationTests-\(UUID().uuidString)", isDirectory: true)
+        tempDir = URL(fileURLWithPath: "/private/tmp", isDirectory: true)
+            .appendingPathComponent("ig-\(UUID().uuidString.prefix(8))", isDirectory: true)
         try? FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
         tempSocketPath = tempDir.appendingPathComponent("guard.sock").path
     }
@@ -70,6 +71,17 @@ final class IPCIntegrationTests: XCTestCase {
         }
     }
 
+    func testDeadlinePolicyCapsStatusAndKeepsMutationGlobal() {
+        XCTAssertEqual(IPCDeadlinePolicy.timeoutSeconds(command: .status), 120)
+        XCTAssertEqual(IPCDeadlinePolicy.timeoutSeconds(command: .evict), 1_900)
+        XCTAssertEqual(IPCDeadlinePolicy.timeoutSeconds(command: .panicEvict), 1_900)
+        XCTAssertEqual(IPCDeadlinePolicy.timeoutSeconds(command: .evict, globalTimeoutSeconds: 5_000), 1_900)
+        XCTAssertEqual(
+            IPCDeadlinePolicy.timeoutSeconds(command: .status, globalTimeoutSeconds: 60, statusTimeoutSeconds: 120),
+            60
+        )
+    }
+
     // MARK: - Wire protocol
 
     /// A minimal POSIX listener captures what IPCClient writes to the
@@ -87,6 +99,24 @@ final class IPCIntegrationTests: XCTestCase {
         XCTAssertEqual(server.capturedAuth, "test-token")
         XCTAssertEqual(server.capturedCommand, "evict")
         XCTAssertEqual(server.capturedDryRun, true)
+        XCTAssertNotNil(server.capturedRequestID)
+    }
+
+    func testLegacyServerWithoutAuthAckDoesNotReceiveMutatingCommandAndAllowsFallback() throws {
+        let server = try CapturingServer(socketPath: tempSocketPath, sendAuthAck: false, sendResponse: false)
+        server.start()
+        defer { server.stop() }
+
+        let client = IPCClient(socketPath: tempSocketPath, token: "test-token", responseTimeoutSeconds: 1)
+        XCTAssertThrowsError(try client.send(command: .evict)) { error in
+            guard let ipcError = error as? IPCClient.IPCError,
+                  case .connectFailed = ipcError else {
+                XCTFail("Expected connectFailed, got \(error)")
+                return
+            }
+            XCTAssertTrue(ipcError.allowsLocalFallback)
+        }
+        XCTAssertNil(server.capturedCommand)
     }
 
     func testServerErrorIsReturnedToCallerForFallbackDecision() throws {
@@ -105,25 +135,181 @@ final class IPCIntegrationTests: XCTestCase {
         XCTAssertEqual(result.output, "fall back to local runner")
         XCTAssertEqual(server.capturedCommand, "panic-evict")
     }
+
+    func testClosedConnectionAfterCommandIsAmbiguousAndForbidsFallback() throws {
+        let server = try CapturingServer(socketPath: tempSocketPath, sendResponse: false)
+        server.start()
+        defer { server.stop() }
+
+        let client = IPCClient(socketPath: tempSocketPath, token: "test-token", responseTimeoutSeconds: 1)
+        XCTAssertThrowsError(try client.send(command: .evict)) { error in
+            guard let ipcError = error as? IPCClient.IPCError,
+                  case .ambiguousResult = ipcError else {
+                XCTFail("Expected ambiguousResult, got \(error)")
+                return
+            }
+            XCTAssertFalse(ipcError.allowsLocalFallback)
+        }
+    }
+
+    func testSocketFramingRejectsOversizedLine() throws {
+        var sockets = [Int32](repeating: -1, count: 2)
+        XCTAssertEqual(socketpair(AF_UNIX, SOCK_STREAM, 0, &sockets), 0)
+        defer { Darwin.close(sockets[0]); Darwin.close(sockets[1]) }
+        try IPCSocketIO.writeAll(fd: sockets[0], data: Data("12345\n".utf8))
+
+        XCTAssertThrowsError(try IPCSocketIO.readLine(fd: sockets[1], maxBytes: 4)) { error in
+            XCTAssertEqual(error as? IPCSocketIO.SocketError, .lineTooLong)
+        }
+    }
+
+    func testSocketReadUsesAbsoluteDeadline() throws {
+        var sockets = [Int32](repeating: -1, count: 2)
+        XCTAssertEqual(socketpair(AF_UNIX, SOCK_STREAM, 0, &sockets), 0)
+        defer { Darwin.close(sockets[0]); Darwin.close(sockets[1]) }
+
+        XCTAssertThrowsError(try IPCSocketIO.readLine(
+            fd: sockets[1],
+            maxBytes: 64,
+            deadline: DispatchTime.now() + .milliseconds(50)
+        )) { error in
+            XCTAssertEqual(error as? IPCSocketIO.SocketError, .timeout)
+        }
+    }
+
+    func testPeerDisconnectProbeDetectsEOFWithoutConsumingData() throws {
+        var sockets = [Int32](repeating: -1, count: 2)
+        XCTAssertEqual(socketpair(AF_UNIX, SOCK_STREAM, 0, &sockets), 0)
+        defer { Darwin.close(sockets[0]) }
+
+        XCTAssertFalse(IPCSocketIO.peerDisconnected(fd: sockets[0]))
+        try IPCSocketIO.writeAll(fd: sockets[1], data: Data("x".utf8))
+        XCTAssertFalse(IPCSocketIO.peerDisconnected(fd: sockets[0]))
+        Darwin.close(sockets[1])
+        XCTAssertTrue(IPCSocketIO.peerDisconnected(fd: sockets[0]))
+    }
+
+    func testProgressWriteDeadlineIsShortAndSlowReaderWriteReturnsBoundedly() throws {
+        let now = DispatchTime.now()
+        let commandDeadline = now + .seconds(1_900)
+        let frameDeadline = IPCSocketIO.progressWriteDeadline(
+            commandDeadline: commandDeadline,
+            now: now,
+            maxFrameWriteMilliseconds: 50
+        )
+        XCTAssertLessThanOrEqual(frameDeadline.uptimeNanoseconds - now.uptimeNanoseconds, 50_000_000)
+
+        var sockets = [Int32](repeating: -1, count: 2)
+        XCTAssertEqual(socketpair(AF_UNIX, SOCK_STREAM, 0, &sockets), 0)
+        defer { Darwin.close(sockets[0]) }
+        let peerFD = sockets[1]
+        Thread {
+            // Test escape hatch: even a regression to blocking write cannot
+            // hang the suite indefinitely.
+            usleep(250_000)
+            Darwin.close(peerFD)
+        }.start()
+        var sendBuffer: Int32 = 1_024
+        XCTAssertEqual(
+            setsockopt(sockets[0], SOL_SOCKET, SO_SNDBUF, &sendBuffer, socklen_t(MemoryLayout<Int32>.size)),
+            0
+        )
+        try IPCSocketIO.configure(fd: sockets[0], sendTimeoutSeconds: 1, receiveTimeoutSeconds: 1)
+
+        let startedAt = Date()
+        XCTAssertThrowsError(try IPCSocketIO.writeAll(
+            fd: sockets[0],
+            data: Data(repeating: 0x41, count: 1 * 1_024 * 1_024),
+            deadline: frameDeadline
+        )) { error in
+            XCTAssertEqual(error as? IPCSocketIO.SocketError, .timeout)
+        }
+        XCTAssertLessThan(Date().timeIntervalSince(startedAt), 1)
+    }
+
+    func testDoneFrameRequiresMatchingRequestID() throws {
+        let server = try CapturingServer(socketPath: tempSocketPath, includeRequestID: false)
+        server.start()
+        defer { server.stop() }
+
+        let client = IPCClient(socketPath: tempSocketPath, token: "test-token")
+        XCTAssertThrowsError(try client.send(command: .evict)) { error in
+            guard case IPCClient.IPCError.ambiguousResult = error else {
+                XCTFail("Expected ambiguousResult, got \(error)")
+                return
+            }
+        }
+    }
+
+    func testDoneFrameRequiresExitCode() throws {
+        let server = try CapturingServer(socketPath: tempSocketPath, includeExitCode: false)
+        server.start()
+        defer { server.stop() }
+
+        let client = IPCClient(socketPath: tempSocketPath, token: "test-token")
+        XCTAssertThrowsError(try client.send(command: .evict)) { error in
+            guard case IPCClient.IPCError.ambiguousResult = error else {
+                XCTFail("Expected ambiguousResult, got \(error)")
+                return
+            }
+        }
+    }
+
+    func testExplicitAmbiguousCompletionForbidsFallback() throws {
+        let server = try CapturingServer(socketPath: tempSocketPath, ambiguous: true)
+        server.start()
+        defer { server.stop() }
+
+        XCTAssertThrowsError(try IPCClient(socketPath: tempSocketPath, token: "test-token").send(command: .evict)) { error in
+            guard let ipcError = error as? IPCClient.IPCError,
+                  case .ambiguousResult = ipcError else {
+                XCTFail("Expected ambiguousResult, got \(error)")
+                return
+            }
+            XCTAssertFalse(ipcError.allowsLocalFallback)
+        }
+    }
 }
 
 /// Minimal POSIX AF_UNIX listener that accepts one connection, captures
 /// the auth + command NDJSON frames, and replies with a single done frame.
 /// Used by IPCIntegrationTests to verify the IPCClient wire contract.
-private final class CapturingServer {
+private final class CapturingServer: Sendable {
+    private struct State {
+        var listenFD: Int32
+        var capturedAuth: String?
+        var capturedCommand: String?
+        var capturedDryRun: Bool?
+        var capturedRequestID: String?
+    }
+
     let socketPath: String
-    private var listenFD: Int32 = -1
-    private let lock = NSLock()
+    private let state: OSAllocatedUnfairLock<State>
     private let responseExitCode: Int
     private let responseOutput: String
-    private var _capturedAuth: String?
-    private var _capturedCommand: String?
-    private var _capturedDryRun: Bool?
-
-    init(socketPath: String, responseExitCode: Int = 0, responseOutput: String = "ok") throws {
+    private let sendAuthAck: Bool
+    private let sendResponse: Bool
+    private let includeRequestID: Bool
+    private let includeExitCode: Bool
+    private let ambiguous: Bool
+    init(
+        socketPath: String,
+        responseExitCode: Int = 0,
+        responseOutput: String = "ok",
+        sendAuthAck: Bool = true,
+        sendResponse: Bool = true,
+        includeRequestID: Bool = true,
+        includeExitCode: Bool = true,
+        ambiguous: Bool = false
+    ) throws {
         self.socketPath = socketPath
         self.responseExitCode = responseExitCode
         self.responseOutput = responseOutput
+        self.sendAuthAck = sendAuthAck
+        self.sendResponse = sendResponse
+        self.includeRequestID = includeRequestID
+        self.includeExitCode = includeExitCode
+        self.ambiguous = ambiguous
         Darwin.unlink(socketPath)
 
         let fd = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
@@ -153,13 +339,16 @@ private final class CapturingServer {
             Darwin.close(fd)
             throw NSError(domain: "CapturingServer", code: 3)
         }
-        listenFD = fd
+        state = OSAllocatedUnfairLock(initialState: State(listenFD: fd))
     }
 
     deinit {
-        if listenFD >= 0 {
-            Darwin.close(listenFD)
+        let descriptor = state.withLock { current in
+            let descriptor = current.listenFD
+            current.listenFD = -1
+            return descriptor
         }
+        if descriptor >= 0 { Darwin.close(descriptor) }
         Darwin.unlink(socketPath)
     }
 
@@ -170,26 +359,30 @@ private final class CapturingServer {
     }
 
     func stop() {
-        if listenFD >= 0 {
-            Darwin.close(listenFD)
-            listenFD = -1
+        let descriptor = state.withLock { current in
+            let descriptor = current.listenFD
+            current.listenFD = -1
+            return descriptor
         }
+        if descriptor >= 0 { Darwin.close(descriptor) }
     }
 
     var capturedAuth: String? {
-        lock.lock(); defer { lock.unlock() }
-        return _capturedAuth
+        state.withLock { $0.capturedAuth }
     }
     var capturedCommand: String? {
-        lock.lock(); defer { lock.unlock() }
-        return _capturedCommand
+        state.withLock { $0.capturedCommand }
     }
     var capturedDryRun: Bool? {
-        lock.lock(); defer { lock.unlock() }
-        return _capturedDryRun
+        state.withLock { $0.capturedDryRun }
+    }
+    var capturedRequestID: String? {
+        state.withLock { $0.capturedRequestID }
     }
 
     private func serveOnce() {
+        let listenFD = state.withLock { $0.listenFD }
+        guard listenFD >= 0 else { return }
         let clientFD = Darwin.accept(listenFD, nil, nil)
         guard clientFD >= 0 else { return }
         defer { Darwin.close(clientFD) }
@@ -197,29 +390,36 @@ private final class CapturingServer {
         if let authLine = readLine(fd: clientFD),
            let data = authLine.data(using: .utf8),
            let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
-            lock.lock()
-            _capturedAuth = json["auth"] as? String
-            lock.unlock()
+            let auth = json["auth"] as? String
+            state.withLock { $0.capturedAuth = auth }
+            if sendAuthAck, json["auth_ack"] as? Bool == true, let requestID = json["request_id"] as? String {
+                writeFrame(fd: clientFD, ["auth": "ok", "request_id": requestID])
+            }
         }
 
         if let cmdLine = readLine(fd: clientFD),
            let data = cmdLine.data(using: .utf8),
            let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
-            lock.lock()
-            _capturedCommand = json["cmd"] as? String
-            _capturedDryRun = json["dry_run"] as? Bool
-            lock.unlock()
-        }
-
-        let escapedOutput = responseOutput
-            .replacingOccurrences(of: "\\", with: "\\\\")
-            .replacingOccurrences(of: "\"", with: "\\\"")
-        let response = "{\"done\":true,\"exit_code\":\(responseExitCode),\"output\":\"\(escapedOutput)\"}\n"
-        if let responseData = response.data(using: .utf8) {
-            _ = responseData.withUnsafeBytes { ptr in
-                Darwin.write(clientFD, ptr.baseAddress, responseData.count)
+            let command = json["cmd"] as? String
+            let dryRun = json["dry_run"] as? Bool
+            let requestID = json["request_id"] as? String
+            state.withLock { current in
+                current.capturedCommand = command
+                current.capturedDryRun = dryRun
+                current.capturedRequestID = requestID
             }
         }
+
+        guard sendResponse else { return }
+
+        var response: [String: Any] = ["done": true, "output": responseOutput]
+        if ambiguous {
+            response["ambiguous"] = true
+            response["error"] = "accepted command did not finish conclusively"
+        }
+        if includeExitCode { response["exit_code"] = responseExitCode }
+        if includeRequestID, let requestID = capturedRequestID { response["request_id"] = requestID }
+        writeFrame(fd: clientFD, response)
     }
 
     private func readLine(fd: Int32) -> String? {
@@ -231,5 +431,13 @@ private final class CapturingServer {
             if buffer.count > 4096 { return nil }
         }
         return buffer.isEmpty ? nil : String(bytes: buffer, encoding: .utf8)
+    }
+
+    private func writeFrame(fd: Int32, _ object: [String: Any]) {
+        guard var data = try? JSONSerialization.data(withJSONObject: object) else { return }
+        data.append(UInt8(ascii: "\n"))
+        _ = data.withUnsafeBytes { ptr in
+            Darwin.write(fd, ptr.baseAddress, data.count)
+        }
     }
 }

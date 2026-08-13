@@ -9,13 +9,64 @@ public struct ICloudGuardApp: App {
     @State private var appConfigModel = AppConfigModel()
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
 
+    private let instanceLock: AdvisoryFileLock?
     private var ipcServer: IPCServer?
 
     public init() {
-        AppPaths.ensureHomeDir()
-        AppPaths.seedDefaultConfigIfMissing()
-        UNUserNotificationCenter.current().delegate = NotificationCenterDelegate.shared
+        do {
+            try AppPaths.ensureHomeDir()
+        } catch {
+            instanceLock = nil
+            FileHandle.standardError.write(Data("Application home initialization failed: \(error.localizedDescription)\n".utf8))
+            return
+        }
+        do {
+            let lock = try AdvisoryFileLock(path: AppPaths.instanceLock.path)
+            try lock.writeOwnerPID()
+            instanceLock = lock
+        } catch {
+            instanceLock = nil
+            FileHandle.standardError.write(Data("iCloud Guard is already running\n".utf8))
+            return
+        }
+
+        do {
+            try AppPaths.seedDefaultConfigIfMissing()
+        } catch {
+            FileHandle.standardError.write(Data("Configuration initialization failed: \(error.localizedDescription)\n".utf8))
+        }
         UserDefaults.standard.register(defaults: ["notificationsEnabled": true])
+        if SystemIntegrationPolicy.isEnabled() {
+            let center = UNUserNotificationCenter.current()
+            center.delegate = NotificationCenterDelegate.shared
+            let restore = UNNotificationAction(
+                identifier: GuardNotificationCategory.restoreLast,
+                title: "Restore Last Run",
+                options: [.foreground]
+            )
+            let pause = UNNotificationAction(
+                identifier: GuardNotificationCategory.pause,
+                title: "Pause Guard"
+            )
+            center.setNotificationCategories([
+                UNNotificationCategory(
+                    identifier: GuardNotificationCategory.eviction,
+                    actions: [restore, pause],
+                    intentIdentifiers: []
+                ),
+                UNNotificationCategory(
+                    identifier: GuardNotificationCategory.attention,
+                    actions: [pause],
+                    intentIdentifiers: []
+                ),
+            ])
+            let notificationsEnabled = UserDefaults.standard.bool(forKey: "notificationsEnabled")
+            Task {
+                await Notifier.shared.activateSystemNotificationCenter(
+                    notificationsEnabled: notificationsEnabled
+                )
+            }
+        }
 
         // Write PID file so CLI can detect the running GUI
         try? AppPaths.writePID()
@@ -40,19 +91,44 @@ public struct ICloudGuardApp: App {
         Window("_", id: "_hidden") {
             EmptyView()
                 .onAppear {
+                    guard instanceLock != nil else {
+                        NSApplication.shared.terminate(nil)
+                        return
+                    }
                     appConfigModel.onChange = { [viewModel] in
                         Task { @MainActor in
-                            viewModel.reloadConfig()
+                            viewModel.reloadConfig(
+                                config: appConfigModel.config,
+                                selectedScopeID: appConfigModel.selectedScopeID
+                            )
                         }
                     }
                     // Route CLI commands (icloud-guard status/evict/panic-evict)
                     // to the live guard service so CLI and app share one engine.
-                    ipcServer?.commandHandler = { [viewModel] command, dryRun, progress in
-                        await viewModel.executeIPCCommand(command, dryRun: dryRun, progress: progress)
+                    viewModel.onServiceActivated = { [viewModel] in
+                        ipcServer?.commandHandler = { [viewModel] command, dryRun, cancellation, progress in
+                            await viewModel.executeIPCCommand(
+                                command,
+                                dryRun: dryRun,
+                                cancellation: cancellation,
+                                progress: progress
+                            )
+                        }
+                    }
+                    viewModel.onServiceActivated?()
+                    appDelegate.prepareForTermination = { [viewModel] in
+                        await viewModel.stopGuardServiceAndWait()
                     }
                     // Start guarding at launch — not on first menu-bar click.
-                    viewModel.startGuardService(scopePath: appConfigModel.config.scope.path)
+                    viewModel.startGuardServices(
+                        config: appConfigModel.config,
+                        selectedScopeID: appConfigModel.selectedScopeID
+                    )
                     viewModel.refreshPolicyCache()
+                    viewModel.requestFirstRunDoctorReview()
+                }
+                .onReceive(NotificationCenter.default.publisher(for: NSApplication.willTerminateNotification)) { _ in
+                    appConfigModel.flushPending()
                 }
         }
             .windowResizability(.contentSize)
@@ -63,6 +139,7 @@ public struct ICloudGuardApp: App {
                 .environment(appConfigModel)
         } label: {
             Image(systemName: viewModel.statusIcon)
+                .accessibilityLabel("iCloud Guard: \(viewModel.statusText)")
         }
         .menuBarExtraStyle(.window)
 
@@ -78,8 +155,11 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Held for the app's lifetime: keeps scan and watchlist timers from
     /// being deferred by App Nap. Does NOT prevent system sleep.
     private var activity: NSObjectProtocol?
+    var prepareForTermination: (@MainActor @Sendable () async -> Bool)?
+    private var terminationPreparationInProgress = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        guard SystemIntegrationPolicy.isEnabled() else { return }
         activity = ProcessInfo.processInfo.beginActivity(
             options: [.userInitiated],
             reason: "iCloud Guard background scanning"
@@ -101,11 +181,34 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        guard AppPaths.pidBelongsToCurrentProcess() else { return }
         AppPaths.unlinkSocket()
-        AppPaths.removePID()
+        AppPaths.removeOwnedPID()
+    }
+
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard let prepareForTermination else { return .terminateNow }
+        guard !terminationPreparationInProgress else { return .terminateLater }
+        terminationPreparationInProgress = true
+        Task { @MainActor [weak self] in
+            let ready = await prepareForTermination()
+            self?.terminationPreparationInProgress = false
+            sender.reply(toApplicationShouldTerminate: ready)
+        }
+        return .terminateLater
+    }
+}
+
+enum SystemIntegrationPolicy {
+    static let disableEnvironmentKey = "ICLOUD_GUARD_DISABLE_SYSTEM_INTEGRATIONS"
+
+    static func isEnabled(environment: [String: String] = ProcessInfo.processInfo.environment) -> Bool {
+        environment[disableEnvironmentKey] != "1"
     }
 }
 
 extension Notification.Name {
     static let icloudGuardEvict = Notification.Name("icloudGuardEvict")
+    static let icloudGuardRestoreLast = Notification.Name("icloudGuardRestoreLast")
+    static let icloudGuardPause = Notification.Name("icloudGuardPause")
 }

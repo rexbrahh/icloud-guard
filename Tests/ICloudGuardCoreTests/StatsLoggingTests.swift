@@ -75,6 +75,22 @@ final class StatsLoggingTests: XCTestCase {
         )
     }
 
+    func testLoggerSerializesConcurrentWrites() throws {
+        let logURL = tempDir.appendingPathComponent("concurrent.log")
+        let logger = Logger(logPath: logURL.path)
+
+        DispatchQueue.concurrentPerform(iterations: 20) { index in
+            logger.log("concurrent-marker-\(index)")
+        }
+
+        let contents = try String(contentsOf: logURL, encoding: .utf8)
+        let markerLines = contents.split(separator: "\n").filter { $0.contains("concurrent-marker-") }
+        XCTAssertEqual(markerLines.count, 20)
+        for index in 0..<20 {
+            XCTAssertTrue(contents.contains("concurrent-marker-\(index)"))
+        }
+    }
+
     // MARK: - Helpers
 
     private func fileSize(at url: URL) throws -> Int64 {

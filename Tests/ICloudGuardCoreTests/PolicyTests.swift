@@ -63,6 +63,96 @@ final class PolicyTests: XCTestCase {
         XCTAssertEqual(decision.candidates.count, 1)
     }
 
+    func testUnavailableFreeSpaceDoesNotTriggerPanicOrTargetedEviction() {
+        let scan = ScanResult(
+            scopePath: "/tmp",
+            freeBytes: 0,
+            localBytes: 28 * bytesPerGiB,
+            items: [],
+            freeSpaceAvailable: false
+        )
+        let decision = PolicyEngine.evaluate(scan: scan, state: GuardState(), config: config, now: Date())
+
+        XCTAssertEqual(decision.kind, .none)
+        XCTAssertEqual(PolicyEngine.targetedReclaimTargetBytes(scan: scan, config: config.policy), 0)
+    }
+
+    func testUnavailableFreeSpaceFailsClosedForAutomaticLocalAndGrowthTriggers() {
+        let now = Date()
+        let scan = ScanResult(
+            scopePath: "/tmp",
+            freeBytes: 0,
+            localBytes: 100 * bytesPerGiB,
+            items: [snapshot(relativePath: "A.mov", localGiB: 8)],
+            freeSpaceAvailable: false
+        )
+        let state = GuardState(samples: [
+            GuardSample(timestamp: now.addingTimeInterval(-60), localBytes: 1, freeBytes: 0),
+            GuardSample(timestamp: now, localBytes: 100 * bytesPerGiB, freeBytes: 0),
+        ])
+
+        let decision = PolicyEngine.evaluate(scan: scan, state: state, config: config, now: now)
+
+        XCTAssertEqual(decision.kind, .none)
+        XCTAssertTrue(decision.reason.contains("free space unavailable"))
+    }
+
+    func testManualRequestRetainsLocalTargetSemanticsWithoutFreeTelemetry() {
+        let scan = ScanResult(
+            scopePath: "/tmp",
+            freeBytes: 0,
+            localBytes: 100 * bytesPerGiB,
+            items: [snapshot(relativePath: "A.mov", localGiB: 8)],
+            freeSpaceAvailable: false
+        )
+
+        let decision = PolicyEngine.evaluate(
+            scan: scan,
+            state: GuardState(),
+            config: config,
+            now: Date(),
+            manualRequest: true
+        )
+
+        XCTAssertEqual(decision.kind, .targeted)
+    }
+
+    func testManualPanicStillRejectsIncompleteScan() {
+        let scan = ScanResult(
+            scopePath: "/tmp",
+            freeBytes: 100 * bytesPerGiB,
+            localBytes: 100 * bytesPerGiB,
+            items: [snapshot(relativePath: "A.mov", localGiB: 8)],
+            scanComplete: false
+        )
+
+        let decision = PolicyEngine.evaluate(
+            scan: scan,
+            state: GuardState(),
+            config: config,
+            now: Date(),
+            forcePanic: true,
+            manualRequest: true
+        )
+
+        XCTAssertEqual(decision.kind, .none)
+        XCTAssertTrue(decision.reason.contains("incomplete"))
+    }
+
+    func testIncompleteScanDisablesAutomaticEviction() {
+        let scan = ScanResult(
+            scopePath: "/tmp",
+            freeBytes: 20 * bytesPerGiB,
+            localBytes: 100 * bytesPerGiB,
+            items: [snapshot(relativePath: "A.mov", localGiB: 8)],
+            scanComplete: false
+        )
+        let decision = PolicyEngine.evaluate(scan: scan, state: GuardState(), config: config, now: Date())
+
+        XCTAssertEqual(decision.kind, .none)
+        XCTAssertTrue(decision.reason.contains("incomplete"))
+    }
+
     func testCooldownSuppressesTargetedTrim() {
         let items = [snapshot(relativePath: "A.mov", localGiB: 8)]
         let scan = ScanResult(scopePath: "/tmp", freeBytes: 40 * bytesPerGiB, localBytes: 36 * bytesPerGiB, items: items)
@@ -71,6 +161,98 @@ final class PolicyTests: XCTestCase {
 
         XCTAssertEqual(decision.kind, .cooldown)
         XCTAssertNotNil(decision.cooldownRemainingSeconds)
+    }
+
+    func testAutomaticGateUsesFreshCooldownAndExcludesPendingPaths() {
+        let now = Date()
+        let scan = ScanResult(
+            scopePath: "/tmp",
+            freeBytes: 40 * bytesPerGiB,
+            localBytes: 36 * bytesPerGiB,
+            items: []
+        )
+        let pending = EvictionCandidate(
+            path: "/tmp/pending.bin",
+            relativePath: "pending.bin",
+            allocatedBytes: 1,
+            modificationDate: nil
+        )
+        let ready = EvictionCandidate(
+            path: "/tmp/ready.bin",
+            relativePath: "ready.bin",
+            allocatedBytes: 1,
+            modificationDate: nil
+        )
+
+        let result = AutomaticRemediationGate.evaluate(
+            scan: scan,
+            state: GuardState(lastRemediationAt: now),
+            config: config,
+            candidates: [pending, ready],
+            pendingPaths: [pending.path],
+            now: now
+        )
+
+        XCTAssertEqual(result.decision.kind, .cooldown)
+        XCTAssertEqual(result.candidates, [ready])
+    }
+
+    func testDryRunPlannerHasCommandSpecificBudgetParity() {
+        let candidates = [6, 5, 4].enumerated().map { index, bytes in
+            EvictionCandidate(
+                path: "/tmp/\(index)",
+                relativePath: "\(index)",
+                allocatedBytes: Int64(bytes),
+                modificationDate: nil
+            )
+        }
+        let targeted = GuardDecision(
+            kind: .targeted,
+            reason: "targeted reason",
+            candidates: [],
+            reclaimTargetBytes: 7,
+            predictedLocalBytes: 0,
+            predictedFreeBytes: 0,
+            cooldownRemainingSeconds: nil,
+            growthBytes: 0
+        )
+        var panic = targeted
+        panic.kind = .panic
+        panic.reason = "panic reason"
+
+        let evictPlan = EvictionDryRunPlanner.plan(
+            command: .run,
+            decision: targeted,
+            candidates: candidates,
+            batchLimit: 2,
+            panicLimit: 3
+        )
+        let panicPlan = EvictionDryRunPlanner.plan(
+            command: .panicEvict,
+            decision: panic,
+            candidates: candidates,
+            batchLimit: 2,
+            panicLimit: 3
+        )
+
+        XCTAssertEqual(evictPlan.action, .targeted)
+        XCTAssertEqual(evictPlan.reason, "targeted reason")
+        XCTAssertEqual(evictPlan.plannedCount, 2)
+        XCTAssertEqual(evictPlan.plannedBytes, 11)
+        XCTAssertEqual(panicPlan.action, .panic)
+        XCTAssertEqual(panicPlan.reason, "panic reason")
+        XCTAssertEqual(panicPlan.plannedCount, 3)
+        XCTAssertEqual(panicPlan.plannedBytes, 15)
+        XCTAssertEqual(
+            EvictionDryRunPlanner.plan(
+                command: .run,
+                decision: panic,
+                candidates: candidates,
+                batchLimit: 2,
+                panicLimit: 3
+            ),
+            panicPlan
+        )
     }
 
     func testProtectedPathsAreSkipped() {

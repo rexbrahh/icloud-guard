@@ -19,19 +19,27 @@ let package = Package(
         ),
         .target(
             name: "ICloudGuardApp",
-            dependencies: ["ICloudGuardCore"]
+            dependencies: ["ICloudGuardCore"],
+            exclude: ["Resources"]
+        ),
+        .target(
+            name: "ICloudGuardCLIKit",
+            dependencies: [
+                "ICloudGuardCore",
+                .product(name: "ArgumentParser", package: "swift-argument-parser"),
+            ]
         ),
         .executableTarget(
             name: "ICloudGuardCLI",
             dependencies: [
-                "ICloudGuardCore",
                 "ICloudGuardApp",
-                .product(name: "ArgumentParser", package: "swift-argument-parser"),
+                "ICloudGuardCLIKit",
             ]
         ),
         .testTarget(
             name: "ICloudGuardCoreTests",
-            dependencies: ["ICloudGuardCore"]
+            dependencies: ["ICloudGuardCore", "ICloudGuardApp", "ICloudGuardCLIKit"],
+            resources: [.process("Fixtures")]
         ),
     ]
 )

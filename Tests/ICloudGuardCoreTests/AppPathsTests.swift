@@ -1,42 +1,28 @@
+import Darwin
 import Foundation
 import XCTest
 @testable import ICloudGuardCore
 
-/// Tests for AppPaths static helpers.
-///
-/// AppPaths uses hardcoded paths under `~/.icloud-guard/`. We cannot redirect
-/// them, so each test must (a) ensure the home dir exists in setUp and
-/// (b) restore prior state in tearDown. config.toml is backed up before the
-/// test runs and restored afterwards, so seeding it does not pollute the
-/// real user config.
+/// Tests for AppPaths static helpers in an injected temporary app home.
 final class AppPathsTests: XCTestCase {
+    private var sandboxURL: URL!
+    private var previousOverride: String?
 
-    /// Saved copy of the user's config.toml, captured in setUp so we can
-    /// restore it in tearDown. nil if no config existed before the test.
-    private var configBackup: (url: URL, contents: String)?
-
-    override func setUp() {
-        super.setUp()
-        // Most helpers assume the home dir exists.
-        AppPaths.ensureHomeDir()
-        // Back up config.toml so tests that create or mutate it can be undone.
-        let cfg = AppPaths.config
-        if FileManager.default.fileExists(atPath: cfg.path),
-           let contents = try? String(contentsOf: cfg, encoding: .utf8) {
-            configBackup = (cfg, contents)
-        }
+    override func setUpWithError() throws {
+        try super.setUpWithError()
+        previousOverride = ProcessInfo.processInfo.environment[AppPaths.homeOverrideEnvironmentKey]
+        sandboxURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("icloud-guard-app-paths-\(UUID().uuidString)", isDirectory: true)
+        setenv(AppPaths.homeOverrideEnvironmentKey, sandboxURL.path, 1)
+        try AppPaths.ensureHomeDir()
     }
 
     override func tearDown() {
-        // Always remove the pid file we may have written.
-        AppPaths.removePID()
-        // Always remove the token file we may have generated.
-        try? FileManager.default.removeItem(at: AppPaths.tokenFile)
-        // Restore config.toml to its pre-test state, or remove it if we created it.
-        if let backup = configBackup {
-            try? backup.contents.write(to: backup.url, atomically: true, encoding: .utf8)
+        try? FileManager.default.removeItem(at: sandboxURL)
+        if let previousOverride {
+            setenv(AppPaths.homeOverrideEnvironmentKey, previousOverride, 1)
         } else {
-            try? FileManager.default.removeItem(at: AppPaths.config)
+            unsetenv(AppPaths.homeOverrideEnvironmentKey)
         }
         super.tearDown()
     }
@@ -118,7 +104,7 @@ final class AppPathsTests: XCTestCase {
         try? FileManager.default.removeItem(at: AppPaths.config)
         XCTAssertFalse(FileManager.default.fileExists(atPath: AppPaths.config.path))
 
-        AppPaths.seedDefaultConfigIfMissing()
+        try AppPaths.seedDefaultConfigIfMissing()
         XCTAssertTrue(
             FileManager.default.fileExists(atPath: AppPaths.config.path),
             "seedDefaultConfigIfMissing should create config.toml when absent"
@@ -127,7 +113,7 @@ final class AppPathsTests: XCTestCase {
         let firstContents = try String(contentsOf: AppPaths.config, encoding: .utf8)
 
         // Idempotency: a second call must not modify the file.
-        AppPaths.seedDefaultConfigIfMissing()
+        try AppPaths.seedDefaultConfigIfMissing()
         XCTAssertTrue(FileManager.default.fileExists(atPath: AppPaths.config.path))
 
         let secondContents = try String(contentsOf: AppPaths.config, encoding: .utf8)
@@ -182,5 +168,21 @@ final class AppPathsTests: XCTestCase {
             0o700,
             "homeDir should have posixPermissions 0700"
         )
+    }
+
+    func testEnsureHomeDirRejectsSymlinkWithoutChangingTargetMode() throws {
+        try FileManager.default.removeItem(at: sandboxURL)
+        let target = sandboxURL.deletingLastPathComponent()
+            .appendingPathComponent("icloud-guard-home-target-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: target, withIntermediateDirectories: false)
+        XCTAssertEqual(chmod(target.path, 0o755), 0)
+        addTeardownBlock { try? FileManager.default.removeItem(at: target) }
+        try FileManager.default.createSymbolicLink(at: sandboxURL, withDestinationURL: target)
+
+        XCTAssertThrowsError(try AppPaths.ensureHomeDir())
+        let mode = try XCTUnwrap(
+            FileManager.default.attributesOfItem(atPath: target.path)[.posixPermissions] as? NSNumber
+        )
+        XCTAssertEqual(mode.intValue, 0o755)
     }
 }

@@ -1,6 +1,7 @@
 import Foundation
 import Darwin
 import ICloudGuardCore
+import os
 
 /// Unix domain socket IPC server for CLI ↔ GUI communication.
 ///
@@ -8,30 +9,162 @@ import ICloudGuardCore
 /// Protocol: streaming NDJSON (newline-delimited JSON).
 /// Auth: first line from client must be `{"auth":"<token>"}` matching `guard.token`.
 /// Server responds with `{"ok":"progress",...}` lines + final `{"done":true,"exit_code":0,"output":"..."}`.
-final class IPCServer {
-    private var listenFD: Int32 = -1
-    private var acceptQueue: DispatchQueue!
-    private var isRunning = false
+final class IPCServer: Sendable {
+    private final class Connection: Sendable {
+        private struct State {
+            var fd: Int32
+            var loggedClosedWrite = false
+            var writeFailed = false
+        }
+
+        private let state: OSAllocatedUnfairLock<State>
+
+        init(fd: Int32) { state = OSAllocatedUnfairLock(initialState: State(fd: fd)) }
+
+        var fdForConfiguration: Int32 {
+            state.withLock { $0.fd }
+        }
+
+        var isUsable: Bool {
+            state.withLock { $0.fd >= 0 && !$0.writeFailed }
+        }
+
+        var peerDisconnected: Bool {
+            let currentFD = state.withLock { $0.fd }
+            return currentFD < 0 || IPCSocketIO.peerDisconnected(fd: currentFD)
+        }
+
+        func readLine(maxBytes: Int, deadline: DispatchTime) throws -> String {
+            let currentFD = state.withLock { $0.fd }
+            guard currentFD >= 0 else { throw IPCSocketIO.SocketError.closed }
+            return try IPCSocketIO.readLine(fd: currentFD, maxBytes: maxBytes, deadline: deadline)
+        }
+
+        @discardableResult
+        func send(_ object: [String: Any], deadline: DispatchTime) -> Bool {
+            guard let json = try? JSONSerialization.data(withJSONObject: object) else {
+                fputs("[icloud-guard] IPC response serialization failed\n", stderr)
+                return false
+            }
+            return state.withLock { state in
+                guard state.fd >= 0 else {
+                    if !state.loggedClosedWrite {
+                        state.loggedClosedWrite = true
+                        fputs("[icloud-guard] IPC response write skipped: connection closed\n", stderr)
+                    }
+                    return false
+                }
+                do {
+                    try IPCSocketIO.writeAll(
+                        fd: state.fd,
+                        data: json + Data([UInt8(ascii: "\n")]),
+                        deadline: deadline
+                    )
+                    return true
+                } catch {
+                    state.writeFailed = true
+                    Darwin.shutdown(state.fd, SHUT_RDWR)
+                    fputs("[icloud-guard] IPC response write failed: \(error)\n", stderr)
+                    return false
+                }
+            }
+        }
+
+        func close() {
+            let currentFD = state.withLock { state in
+                let currentFD = state.fd
+                state.fd = -1
+                return currentFD
+            }
+            if currentFD >= 0 {
+                Darwin.shutdown(currentFD, SHUT_RDWR)
+                Darwin.close(currentFD)
+            }
+        }
+
+        deinit { close() }
+    }
+
+    private final class CommandResultBox: Sendable {
+        private let result = OSAllocatedUnfairLock<IPCCommandResult?>(initialState: nil)
+
+        func store(_ value: IPCCommandResult) {
+            result.withLock { $0 = value }
+        }
+
+        func load() -> IPCCommandResult? {
+            result.withLock { $0 }
+        }
+    }
+
+    typealias CommandHandler = @Sendable (
+        GuardCommand,
+        Bool,
+        EvictionCancellation,
+        @escaping @Sendable (String) -> Void
+    ) async -> IPCCommandResult
+
+    private struct ServerState {
+        var listenFD: Int32
+        var isRunning = false
+        var commandHandler: CommandHandler?
+    }
+
+    private let state: OSAllocatedUnfairLock<ServerState>
+    private let acceptQueue: DispatchQueue
     private let token: String
+    private let socketURL: URL
+    private let installsSignalHandlers: Bool
+    private let connectionSlots = DispatchSemaphore(value: 4)
 
     /// Executes parsed commands against the live guard service.
     /// Parameters: command, dryRun, progress-callback. Returns (output, exitCode).
-    var commandHandler: ((GuardCommand, Bool, @escaping @Sendable (String) -> Void) async -> (output: String, exitCode: Int))?
+    var commandHandler: CommandHandler? {
+        get { state.withLock { $0.commandHandler } }
+        set { state.withLock { $0.commandHandler = newValue } }
+    }
 
-    init() throws {
+    init(
+        socketURL: URL = AppPaths.socket,
+        token injectedToken: String? = nil,
+        installSignalHandlers: Bool = true
+    ) throws {
+        let socketPath = socketURL.path
+        let pathProbe = sockaddr_un()
+        let sunPathSize = MemoryLayout.size(ofValue: pathProbe.sun_path)
+        guard socketPath.utf8.count < sunPathSize else {
+            throw NSError(domain: "IPCServer", code: 4, userInfo: [NSLocalizedDescriptionKey: "socket path is too long"])
+        }
+
         // Generate or read auth token
-        if let existingToken = AppPaths.readToken() {
+        if let injectedToken {
+            guard !injectedToken.isEmpty else {
+                throw NSError(
+                    domain: "IPCServer",
+                    code: 5,
+                    userInfo: [NSLocalizedDescriptionKey: "injected IPC token must not be empty"]
+                )
+            }
+            token = injectedToken
+        } else if let existingToken = AppPaths.readToken() {
             token = existingToken
         } else {
             token = try AppPaths.generateToken()
         }
 
         // Crash recovery: reap stale socket and PID
-        AppPaths.reapStaleSocket()
-        AppPaths.reapStalePID()
+        if socketURL.standardizedFileURL == AppPaths.socket.standardizedFileURL {
+            AppPaths.reapStaleSocket()
+            AppPaths.reapStalePID()
+            AppPaths.unlinkSocket()
+        } else {
+            // A caller-provided socket is an explicit isolated lifecycle root.
+            // It is safe to replace only that exact path.
+            Darwin.unlink(socketPath)
+        }
 
-        // Unlink any existing socket file before bind
-        AppPaths.unlinkSocket()
+        self.socketURL = socketURL
+        installsSignalHandlers = installSignalHandlers
 
         // Create socket — use a local so closures below don't capture self
         // before all stored members are initialized.
@@ -43,9 +176,7 @@ final class IPCServer {
         // Bind to AppPaths.socket
         var addr = sockaddr_un()
         addr.sun_family = sa_family_t(AF_UNIX)
-        let socketPath = AppPaths.socket.path
         // Hoist size to a local before withUnsafeMutablePointer to avoid ExclusivityViolation.
-        let sunPathSize = MemoryLayout.size(ofValue: addr.sun_path)
         withUnsafeMutablePointer(to: &addr.sun_path) { ptr in
             socketPath.withCString { cPath in
                 _ = strncpy(UnsafeMutableRawPointer(ptr), cPath, sunPathSize - 1)
@@ -70,93 +201,143 @@ final class IPCServer {
             throw NSError(domain: "IPCServer", code: 3, userInfo: [NSLocalizedDescriptionKey: "listen() failed"])
         }
 
-        listenFD = fd
-
+        state = OSAllocatedUnfairLock(initialState: ServerState(listenFD: fd))
         acceptQueue = DispatchQueue(label: "icloud-guard.ipc.accept", qos: .utility)
     }
 
     /// Start the accept loop on a background queue.
     func start() {
-        guard !isRunning else { return }
-        isRunning = true
+        let shouldStart = state.withLock { state in
+            guard !state.isRunning, state.listenFD >= 0 else { return false }
+            state.isRunning = true
+            return true
+        }
+        guard shouldStart else { return }
 
         // Writes to clients that vanished mid-command must fail harmlessly,
         // not kill the app.
         signal(SIGPIPE, SIG_IGN)
 
-        // Install signal handlers for clean shutdown
-        signal(SIGTERM) { _ in
-            AppPaths.unlinkSocket()
-            AppPaths.removePID()
-            exit(0)
-        }
-        signal(SIGINT) { _ in
-            AppPaths.unlinkSocket()
-            AppPaths.removePID()
-            exit(0)
+        // Only the process-owning production server installs global handlers.
+        if installsSignalHandlers {
+            signal(SIGTERM) { _ in
+                AppPaths.unlinkSocket()
+                AppPaths.removeOwnedPID()
+                exit(0)
+            }
+            signal(SIGINT) { _ in
+                AppPaths.unlinkSocket()
+                AppPaths.removeOwnedPID()
+                exit(0)
+            }
         }
 
-        acceptQueue.async { [weak self] in
-            self?.acceptLoop()
+        let state = state
+        let token = token
+        let slots = connectionSlots
+        acceptQueue.async {
+            Self.acceptLoop(state: state, token: token, connectionSlots: slots)
         }
     }
 
     /// Stop the server and clean up.
     func stop() {
-        isRunning = false
-        if listenFD >= 0 {
-            Darwin.close(listenFD)
-            listenFD = -1
+        let listenFD = state.withLock { state in
+            state.isRunning = false
+            let descriptor = state.listenFD
+            state.listenFD = -1
+            return descriptor
         }
-        AppPaths.unlinkSocket()
+        if listenFD >= 0 { Darwin.close(listenFD) }
+        Darwin.unlink(socketURL.path)
     }
 
-    private func acceptLoop() {
-        while isRunning {
+    private static func acceptLoop(
+        state: OSAllocatedUnfairLock<ServerState>,
+        token: String,
+        connectionSlots: DispatchSemaphore
+    ) {
+        while true {
+            let listenFD = state.withLock { $0.isRunning ? $0.listenFD : -1 }
+            guard listenFD >= 0 else { return }
             let clientFD = Darwin.accept(listenFD, nil, nil)
-            guard clientFD >= 0 else { continue }
+            if clientFD < 0 {
+                if state.withLock({ !$0.isRunning }) { return }
+                continue
+            }
 
-            // Each connection gets its own queue — one slow or dead client
-            // must never block the others.
-            DispatchQueue.global(qos: .utility).async { [weak self] in
-                self?.handleConnection(fd: clientFD)
+            guard connectionSlots.wait(timeout: .now()) == .success else {
+                Darwin.close(clientFD)
+                continue
+            }
+
+            let slots = connectionSlots
+            let connection = Connection(fd: clientFD)
+            DispatchQueue.global(qos: .utility).async {
+                defer { slots.signal() }
+                Self.handleConnection(connection: connection, state: state, token: token)
             }
         }
     }
 
-    private func handleConnection(fd: Int32) {
-        defer { Darwin.close(fd) }
+    private static func handleConnection(
+        connection: Connection,
+        state: OSAllocatedUnfairLock<ServerState>,
+        token: String
+    ) {
+        defer { connection.close() }
+        do {
+            // The accepted descriptor is stable until Connection.close().
+            try IPCSocketIO.configure(fd: connection.fdForConfiguration, sendTimeoutSeconds: 5, receiveTimeoutSeconds: 5)
+        } catch {
+            return
+        }
+        let requestDeadline = DispatchTime.now() + .seconds(5)
 
         // Read auth line (first NDJSON frame)
-        guard let authLine = readLine(fd: fd) else {
-            sendError(fd: fd, message: "No auth received")
+        guard let authLine = try? connection.readLine(maxBytes: 4_096, deadline: requestDeadline) else {
+            sendError(connection: connection, message: "No auth received")
             return
         }
 
         // Verify auth token
         guard let authData = authLine.data(using: .utf8),
               let authJson = try? JSONSerialization.jsonObject(with: authData) as? [String: Any],
-              let authToken = authJson["auth"] as? String,
-              authToken == token else {
-            sendError(fd: fd, message: "Auth rejected")
+              let authToken = authJson["auth"] as? String else {
+            sendError(connection: connection, message: "Auth rejected")
             return
+        }
+        let authRequestID = authJson["request_id"] as? String
+        let wantsAuthAcknowledgement = authJson["auth_ack"] as? Bool == true
+        let validAuthRequestID = authRequestID.flatMap { isValidRequestID($0) ? $0 : nil }
+        guard authToken == token else {
+            sendAuthRejected(connection: connection, requestID: validAuthRequestID)
+            return
+        }
+        if wantsAuthAcknowledgement {
+            guard let validAuthRequestID else {
+                sendError(connection: connection, message: "Invalid auth acknowledgement request ID")
+                return
+            }
+            sendAuthAccepted(connection: connection, requestID: validAuthRequestID)
         }
 
         // Read command line (second NDJSON frame)
-        guard let cmdLine = readLine(fd: fd) else {
-            sendError(fd: fd, message: "No command received")
+        guard let cmdLine = try? connection.readLine(maxBytes: 4_096, deadline: requestDeadline) else {
+            sendError(connection: connection, message: "No command received")
             return
         }
 
         // Parse command
         guard let cmdData = cmdLine.data(using: .utf8),
               let cmdJson = try? JSONSerialization.jsonObject(with: cmdData) as? [String: Any],
-              let cmd = cmdJson["cmd"] as? String else {
-            sendError(fd: fd, message: "Invalid command")
+              let cmd = cmdJson["cmd"] as? String,
+              let dryRun = cmdJson["dry_run"] as? Bool,
+              let requestID = cmdJson["request_id"] as? String,
+              isValidRequestID(requestID) else {
+            sendError(connection: connection, message: "Invalid command envelope")
             return
         }
-
-        let dryRun = (cmdJson["dry_run"] as? Bool) ?? false
 
         let command: GuardCommand
         switch cmd {
@@ -164,79 +345,124 @@ final class IPCServer {
         case "evict": command = .run
         case "panic-evict": command = .panicEvict
         default:
-            sendError(fd: fd, message: "Unknown command: \(cmd)")
+            sendError(connection: connection, message: "Unknown command: \(cmd)", requestID: requestID)
             return
         }
 
-        guard let handler = commandHandler else {
-            sendError(fd: fd, message: "GUI command execution unavailable; fall back to local runner")
+        guard let handler = state.withLock({ $0.commandHandler }) else {
+            sendError(connection: connection, message: "GUI command execution unavailable", requestID: requestID)
             return
         }
 
         // Bridge the async handler into this serial queue with a semaphore.
         let semaphore = DispatchSemaphore(value: 0)
-        var resultOutput = ""
-        var resultCode = 1
+        let resultBox = CommandResultBox()
+        let deadlineCommand: IPCClient.Command = command == .status
+            ? .status
+            : (command == .panicEvict ? .panicEvict : .evict)
+        let commandDeadline = DispatchTime.now() + .seconds(
+            IPCDeadlinePolicy.timeoutSeconds(command: deadlineCommand)
+        )
+        let commandCancellation = EvictionCancellation()
 
-        Task {
-            let result = await handler(command, dryRun, { [weak self] message in
-                self?.sendProgress(fd: fd, message: message)
+        let task = Task {
+            let result = await handler(command, dryRun, commandCancellation, { message in
+                Self.sendProgress(connection: connection, message: message, requestID: requestID, deadline: commandDeadline)
             })
-            resultOutput = result.output
-            resultCode = result.exitCode
+            resultBox.store(result)
             semaphore.signal()
         }
 
-        // Generous ceiling: a full-drive scan + trim can take minutes.
-        if semaphore.wait(timeout: .now() + .seconds(900)) == .timedOut {
-            sendError(fd: fd, message: "Command timed out")
-            return
+        // Poll so a failed progress write releases this connection slot
+        // promptly instead of waiting for the full command timeout.
+        while resultBox.load() == nil {
+            let now = DispatchTime.now()
+            if now.uptimeNanoseconds >= commandDeadline.uptimeNanoseconds {
+                commandCancellation.cancel()
+                task.cancel()
+                _ = semaphore.wait(timeout: .now() + .seconds(2))
+                sendAmbiguous(connection: connection, message: "Command timed out after acceptance", requestID: requestID)
+                return
+            }
+            let nextProbe = now + .milliseconds(250)
+            let pollDeadline = nextProbe.uptimeNanoseconds < commandDeadline.uptimeNanoseconds
+                ? nextProbe
+                : commandDeadline
+            if semaphore.wait(timeout: pollDeadline) == .success { break }
+            if !connection.isUsable || connection.peerDisconnected {
+                commandCancellation.cancel()
+                task.cancel()
+                _ = semaphore.wait(timeout: .now() + .seconds(2))
+                return
+            }
         }
 
-        sendDone(fd: fd, exitCode: resultCode, output: resultOutput)
+        guard let result = resultBox.load() else {
+            sendError(connection: connection, message: "Command completed without a result", requestID: requestID)
+            return
+        }
+        sendDone(connection: connection, result: result, requestID: requestID)
     }
 
     // MARK: - Socket I/O
 
-    private func readLine(fd: Int32) -> String? {
-        var buffer = [UInt8]()
-        var byte: UInt8 = 0
-        while Darwin.read(fd, &byte, 1) == 1 {
-            if byte == UInt8(ascii: "\n") { break }
-            buffer.append(byte)
-            if buffer.count > 4096 { return nil } // Max line length
+    private static func sendFrame(connection: Connection, _ object: [String: Any], deadline: DispatchTime? = nil) {
+        _ = connection.send(object, deadline: deadline ?? DispatchTime.now() + .seconds(5))
+    }
+
+    private static func sendProgress(connection: Connection, message: String, requestID: String, deadline: DispatchTime) {
+        var frame: [String: Any] = ["ok": "progress", "message": message]
+        frame["request_id"] = requestID
+        _ = connection.send(
+            frame,
+            deadline: IPCSocketIO.progressWriteDeadline(commandDeadline: deadline)
+        )
+    }
+
+    private static func sendAuthAccepted(connection: Connection, requestID: String) {
+        sendFrame(connection: connection, ["auth": "ok", "request_id": requestID])
+    }
+
+    private static func sendAuthRejected(connection: Connection, requestID: String?) {
+        var frame: [String: Any] = [
+            "done": true,
+            "exit_code": 1,
+            "error": "Auth rejected",
+            "auth": "rejected",
+        ]
+        if let requestID { frame["request_id"] = requestID }
+        sendFrame(connection: connection, frame)
+    }
+
+    private static func sendDone(connection: Connection, result: IPCCommandResult, requestID: String) {
+        var frame: [String: Any] = ["done": true, "exit_code": result.exitCode, "output": result.output]
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        if let data = try? encoder.encode(result),
+           let object = try? JSONSerialization.jsonObject(with: data) {
+            frame["result"] = object
         }
-        return buffer.isEmpty ? nil : String(bytes: buffer, encoding: .utf8)
+        frame["request_id"] = requestID
+        sendFrame(connection: connection, frame)
     }
 
-    private func sendLine(fd: Int32, _ line: String) {
-        let data = (line + "\n").data(using: .utf8) ?? Data()
-        data.withUnsafeBytes { ptr in
-            _ = Darwin.write(fd, ptr.baseAddress, data.count)
-        }
+    private static func sendError(connection: Connection, message: String, requestID: String? = nil) {
+        var frame: [String: Any] = ["done": true, "exit_code": 1, "error": message]
+        if let requestID { frame["request_id"] = requestID }
+        sendFrame(connection: connection, frame)
     }
 
-    private func sendProgress(fd: Int32, message: String) {
-        let json = "{\"ok\":\"progress\",\"message\":\"\(escapeJSON(message))\"}"
-        sendLine(fd: fd, json)
+    private static func sendAmbiguous(connection: Connection, message: String, requestID: String) {
+        sendFrame(connection: connection, [
+            "done": true,
+            "exit_code": 75,
+            "error": message,
+            "ambiguous": true,
+            "request_id": requestID,
+        ])
     }
 
-    private func sendDone(fd: Int32, exitCode: Int, output: String) {
-        let json = "{\"done\":true,\"exit_code\":\(exitCode),\"output\":\"\(escapeJSON(output))\"}"
-        sendLine(fd: fd, json)
-    }
-
-    private func sendError(fd: Int32, message: String) {
-        let json = "{\"done\":true,\"exit_code\":1,\"error\":\"\(escapeJSON(message))\"}"
-        sendLine(fd: fd, json)
-    }
-
-    private func escapeJSON(_ value: String) -> String {
-        value
-            .replacingOccurrences(of: "\\", with: "\\\\")
-            .replacingOccurrences(of: "\"", with: "\\\"")
-            .replacingOccurrences(of: "\n", with: "\\n")
-            .replacingOccurrences(of: "\r", with: "\\r")
-            .replacingOccurrences(of: "\t", with: "\\t")
+    private static func isValidRequestID(_ requestID: String) -> Bool {
+        !requestID.isEmpty && requestID.utf8.count <= 128
     }
 }
