@@ -1,128 +1,147 @@
-name: Beta Release (date+build-time versioning)
+name: Beta Release
 
 on:
   push:
-    branches: [beta]
-    tags:
-      - 'beta-*'
+    tags: ['beta-*']
+
+permissions:
+  contents: write
 
 jobs:
   beta-release:
     runs-on: macos-14
-    permissions:
-      contents: write
-    env:
-      HAS_MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 != '' }}
-      HAS_NOTARIZATION: ${{ secrets.APPLE_ID != '' && secrets.APPLE_TEAM_ID != '' && secrets.APPLE_APP_SPECIFIC_PASSWORD != '' }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
 
       - name: Select Xcode
         run: sudo xcode-select -s /Applications/Xcode.app
 
-      - name: Build & Test
+      - name: Install pinned static-analysis tools
         run: |
-          swift build -c release
-          swift test
+          set -euo pipefail
+          TOOLS_DIR="$RUNNER_TEMP/static-tools"
+          scripts/ci-install-tools.sh "$TOOLS_DIR"
+          echo "$TOOLS_DIR" >> "$GITHUB_PATH"
 
-      - name: Build .app bundle
-        run: ./scripts/build-app.sh --release
-
-      - name: Generate beta version
-        id: version
+      - name: Verify release gates before secrets
         run: |
-          if [ "${{ github.ref_type }}" = "tag" ]; then
-            # Tag-triggered: use the tag name minus the 'beta-' prefix as the version
-            VERSION="${GITHUB_REF_NAME#beta-}"
-            echo "Using tag-based version: $VERSION"
-          else
-            # Branch push: timestamp format YYYY.MDD.HMMSS (e.g. 2026.704.50312 for July 4th, 5:03:12 AM)
-            VERSION=$(date -u "+%Y.%-m%-d.%-H%-M%-S")
-            echo "Using timestamp-based version: $VERSION"
-          fi
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
-          echo "Beta version: $VERSION"
-
-      - name: Update Info.plist version
-        run: |
-          plutil -replace CFBundleShortVersionString -string "${{ steps.version.outputs.version }}" .build/ICloudGuard.app/Contents/Info.plist
-          plutil -replace CFBundleVersion -string "${{ github.run_number }}" .build/ICloudGuard.app/Contents/Info.plist
+          set -euo pipefail
+          scripts/release-preflight.sh
+          scripts/test-release.sh
+          swift test \
+            --scratch-path "$RUNNER_TEMP/preflight-test-build" \
+            -Xswiftc -strict-concurrency=complete \
+            -Xswiftc -warnings-as-errors
+          scripts/build-app.sh \
+            --release \
+            --scratch-path "$RUNNER_TEMP/preflight-app-build" \
+            --output "$RUNNER_TEMP/preflight-ICloudGuard.app"
 
       - name: Import Developer ID certificate
-        if: env.HAS_MACOS_CERTIFICATE == 'true'
         env:
-          MACOS_CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
-          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
+          CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
           KEYCHAIN_PASSWORD: ${{ github.run_id }}-${{ github.run_attempt }}
         run: |
+          set -euo pipefail
+          : "${CERTIFICATE:?MACOS_CERTIFICATE_P12_BASE64 is required}"
+          : "${CERTIFICATE_PASSWORD:?MACOS_CERTIFICATE_PASSWORD is required}"
           CERT_PATH="$RUNNER_TEMP/developer-id.p12"
           KEYCHAIN_PATH="$RUNNER_TEMP/app-signing.keychain-db"
-          echo "$MACOS_CERTIFICATE_P12_BASE64" | base64 --decode > "$CERT_PATH"
+          printf '%s' "$CERTIFICATE" | base64 --decode > "$CERT_PATH"
           security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
           security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
           security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
-          security import "$CERT_PATH" -P "$MACOS_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          security import "$CERT_PATH" -P "$CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
           security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
-          security list-keychains -d user -s "$KEYCHAIN_PATH" login.keychain
+          echo "CODESIGN_KEYCHAIN=$KEYCHAIN_PATH" >> "$GITHUB_ENV"
 
-      - name: Sign and verify app bundle
+      - name: Provision isolated notarization profile
+        env:
+          APP_STORE_CONNECT_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
+          APP_STORE_CONNECT_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+          APP_STORE_CONNECT_PRIVATE_KEY_P8: ${{ secrets.APP_STORE_CONNECT_PRIVATE_KEY_P8 }}
+        run: |
+          set -euo pipefail
+          scripts/provision-notary-profile.sh create \
+            --state-dir "$RUNNER_TEMP/icloud-guard-notary-profile" \
+            --profile "icloud-guard-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+            --env-file "$GITHUB_ENV"
+
+      - name: Build, sign, notarize, and verify
         env:
           CODESIGN_IDENTITY: ${{ secrets.CODESIGN_IDENTITY }}
-          CODESIGN_REQUIRE_DEVELOPER_ID: ${{ env.HAS_MACOS_CERTIFICATE }}
-        run: |
-          if [ "$CODESIGN_REQUIRE_DEVELOPER_ID" = "true" ]; then
-            if [ -z "$CODESIGN_IDENTITY" ]; then
-              CODESIGN_IDENTITY=$(security find-identity -v -p codesigning | awk -F'"' '/Developer ID Application/ { print $2; exit }')
-            fi
-            if [ -z "$CODESIGN_IDENTITY" ]; then
-              echo "Developer ID certificate was imported, but no Developer ID Application identity was found." >&2
-              exit 1
-            fi
-          else
-            CODESIGN_IDENTITY="-"
-          fi
-          echo "Signing with identity: $CODESIGN_IDENTITY"
-          codesign --sign "$CODESIGN_IDENTITY" --force --deep --options runtime .build/ICloudGuard.app
-          codesign --verify --deep --strict --verbose=2 .build/ICloudGuard.app
-
-      - name: Notarize and staple app bundle
-        if: env.HAS_NOTARIZATION == 'true'
-        env:
-          APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
         run: |
-          ditto -c -k --keepParent .build/ICloudGuard.app "$RUNNER_TEMP/ICloudGuard-notary.zip"
-          xcrun notarytool submit "$RUNNER_TEMP/ICloudGuard-notary.zip" \
-            --apple-id "$APPLE_ID" \
+          set -euo pipefail
+          : "${CODESIGN_IDENTITY:?CODESIGN_IDENTITY is required}"
+          scripts/release-gate.sh \
+            --channel beta \
+            --tag "$GITHUB_REF_NAME" \
+            --output-dir "$RUNNER_TEMP/release" \
+            --build-number "$GITHUB_RUN_NUMBER" \
+            --sign-identity "$CODESIGN_IDENTITY" \
+            --keychain "$CODESIGN_KEYCHAIN"
+
+      - name: Create authenticated beta update feed
+        if: vars.UPDATE_FEED_ENABLED == 'true'
+        env:
+          UPDATE_FEED_ORIGIN: ${{ vars.UPDATE_FEED_ORIGIN }}
+          UPDATE_FEED_KEY_ID: ${{ vars.UPDATE_FEED_KEY_ID }}
+          UPDATE_FEED_PUBLIC_KEY_X963_BASE64: ${{ vars.UPDATE_FEED_PUBLIC_KEY_X963_BASE64 }}
+          UPDATE_FEED_PRIVATE_KEY_PEM_BASE64: ${{ secrets.UPDATE_FEED_PRIVATE_KEY_PEM_BASE64 }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          : "${UPDATE_FEED_ORIGIN:?UPDATE_FEED_ORIGIN is required}"
+          : "${UPDATE_FEED_KEY_ID:?UPDATE_FEED_KEY_ID is required}"
+          : "${UPDATE_FEED_PUBLIC_KEY_X963_BASE64:?UPDATE_FEED_PUBLIC_KEY_X963_BASE64 is required}"
+          : "${UPDATE_FEED_PRIVATE_KEY_PEM_BASE64:?UPDATE_FEED_PRIVATE_KEY_PEM_BASE64 is required}"
+          VERSION="$(scripts/version.sh)"
+          KEY_PATH="$RUNNER_TEMP/update-feed-private.pem"
+          (umask 077; printf '%s' "$UPDATE_FEED_PRIVATE_KEY_PEM_BASE64" | base64 --decode > "$KEY_PATH")
+          GENERATED_AT="$(date +%s)"
+          EXPIRES_AT="$((GENERATED_AT + 604800))"
+          scripts/update-feed.sh create \
+            --manifest "$RUNNER_TEMP/release/ICloudGuard-beta-$VERSION.zip.json" \
+            --artifact "$RUNNER_TEMP/release/ICloudGuard-beta-$VERSION.zip" \
+            --update-origin "$UPDATE_FEED_ORIGIN" \
+            --channel beta \
             --team-id "$APPLE_TEAM_ID" \
-            --password "$APPLE_APP_SPECIFIC_PASSWORD" \
-            --wait
-          xcrun stapler staple .build/ICloudGuard.app
-          spctl --assess --type execute --verbose=2 .build/ICloudGuard.app
+            --key-id "$UPDATE_FEED_KEY_ID" \
+            --private-key "$KEY_PATH" \
+            --generated-at "$GENERATED_AT" \
+            --expires-at "$EXPIRES_AT" \
+            --output "$RUNNER_TEMP/release/feed-v1.json"
+          scripts/update-feed.sh verify \
+            --feed "$RUNNER_TEMP/release/feed-v1.json" \
+            --update-origin "$UPDATE_FEED_ORIGIN" \
+            --channel beta \
+            --team-id "$APPLE_TEAM_ID" \
+            --key-id "$UPDATE_FEED_KEY_ID" \
+            --public-key-x963-base64 "$UPDATE_FEED_PUBLIC_KEY_X963_BASE64" \
+            --checked-at "$GENERATED_AT"
 
-      - name: Assess app bundle without notarization
-        if: env.HAS_NOTARIZATION != 'true'
+      - name: Publish verified prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          spctl --assess --type execute --verbose=2 .build/ICloudGuard.app || true
+          set -euo pipefail
+          gh release create "$GITHUB_REF_NAME" \
+            "$RUNNER_TEMP"/release/* \
+            --verify-tag \
+            --generate-notes \
+            --prerelease \
+            --title "iCloud Guard $GITHUB_REF_NAME"
 
-      - name: Create zip
+      - name: Remove notarization credentials
+        if: always()
         run: |
-          cd .build
-          zip -r ICloudGuard-beta-${{ steps.version.outputs.version }}.zip ICloudGuard.app
-
-      - name: Create beta release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: beta-${{ steps.version.outputs.version }}
-          name: Beta ${{ steps.version.outputs.version }}
-          prerelease: true
-          files: .build/ICloudGuard-beta-${{ steps.version.outputs.version }}.zip
-          body: |
-            Beta build with date+time versioning.
-
-            Version: ${{ steps.version.outputs.version }}
-            Build: ${{ github.run_number }}
-
-            Beta releases use the format YYYY.MDD.HMMSS for the version string.
-            These are not stable releases — expect rough edges.
+          set -euo pipefail
+          rm -f "$RUNNER_TEMP/update-feed-private.pem"
+          if [[ -x scripts/provision-notary-profile.sh ]]; then
+            scripts/provision-notary-profile.sh cleanup \
+              --state-dir "$RUNNER_TEMP/icloud-guard-notary-profile"
+          fi

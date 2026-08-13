@@ -1,4 +1,4 @@
-name: Build & Test
+name: Build and Test
 
 on:
   push:
@@ -6,29 +6,56 @@ on:
   pull_request:
     branches: [main]
 
+permissions:
+  contents: read
+
 jobs:
   build-and-test:
     runs-on: macos-14
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - name: Select Xcode
         run: sudo xcode-select -s /Applications/Xcode.app
 
-      - name: Build
-        run: swift build -c release
+      - name: Install pinned static-analysis tools
+        run: |
+          set -euo pipefail
+          TOOLS_DIR="$RUNNER_TEMP/static-tools"
+          scripts/ci-install-tools.sh "$TOOLS_DIR"
+          echo "$TOOLS_DIR" >> "$GITHUB_PATH"
 
-      - name: Test
-        run: swift test
+      - name: Verify scripts and release contract
+        run: |
+          set -euo pipefail
+          bash -n scripts/*.sh
+          shellcheck scripts/*.sh
+          actionlint
+          scripts/test-release.sh
+          scripts/release-gate.sh --check --channel tip --tag "tip-${GITHUB_SHA:0:12}"
 
-      - name: Build .app bundle
-        run: ./scripts/build-app.sh --release
+      - name: Test with strict concurrency
+        env:
+          ICLOUD_GUARD_HOME: ${{ runner.temp }}/icloud-guard-home
+        run: |
+          set -euo pipefail
+          swift test \
+            --scratch-path "$RUNNER_TEMP/test-build" \
+            -Xswiftc -strict-concurrency=complete \
+            -Xswiftc -warnings-as-errors
 
-      - name: Memory leak guard
-        run: ./scripts/leak-guard.sh
+      - name: Build app bundle from current sources
+        run: |
+          set -euo pipefail
+          scripts/build-app.sh \
+            --release \
+            --scratch-path "$RUNNER_TEMP/app-build" \
+            --output "$RUNNER_TEMP/ICloudGuard.app"
 
-      - name: Upload .app artifact
-        uses: actions/upload-artifact@v4
+      - name: Upload verified app artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: ICloudGuard-app
-          path: .build/ICloudGuard.app
+          name: ICloudGuard-app-${{ github.sha }}
+          path: ${{ runner.temp }}/ICloudGuard.app
+          if-no-files-found: error
+          retention-days: 7

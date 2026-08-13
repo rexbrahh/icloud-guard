@@ -1,97 +1,99 @@
 #!/bin/bash
-# Memory leak guard — builds, tests, and verifies no unbounded RSS growth.
-#
-# This script runs in two modes:
-#   CI mode (no display): build + test suite + build app bundle
-#   Local mode (has display): also launches app, measures RSS over 30s
-#
-# The test suite exercises all code paths: GuardService actor, timers,
-# file enumeration, IPC, ConfigStore, pollution checks, eviction logic.
-#
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-cd "$SCRIPT_DIR/.."
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=scripts/shell-helpers.sh
+source "$SCRIPT_DIR/shell-helpers.sh"
 
-echo "=== Memory Leak Guard ==="
+[[ $# -eq 2 && "$1" == "--app" ]] || {
+    echo "Usage: scripts/leak-guard.sh --app PATH/TO/ICloudGuard.app" >&2
+    exit 64
+}
 
-# Step 1: Build
-echo "[1/3] Building release binary..."
-swift build -c release 2>&1 | tail -1
-BINARY=".build/release/icloud-guard"
+APP="$(cd "$(dirname "$2")" && pwd -P)/$(basename "$2")"
+BINARY="$APP/Contents/MacOS/ICloudGuard"
+[[ -x "$BINARY" && ! -L "$BINARY" ]] || { echo "ERROR: App executable not found: $BINARY" >&2; exit 1; }
+[[ "$(uname)" == "Darwin" ]] || { echo "ERROR: Runtime leak checks require macOS." >&2; exit 1; }
+BINARY="$(cd "$(dirname "$BINARY")" && pwd -P)/$(basename "$BINARY")"
 
-if [ ! -f "$BINARY" ]; then
-    echo "FAIL: Binary not found at $BINARY"
-    exit 1
+TEST_PARENT="${TMPDIR:-/private/tmp}"
+TEST_PARENT="${TEST_PARENT%/}"
+[[ -d "$TEST_PARENT" && ! -L "$TEST_PARENT" ]] || { echo "ERROR: Temporary parent is unsafe." >&2; exit 1; }
+TEST_ROOT="$(mktemp -d "$TEST_PARENT/icloud-guard-leak.XXXXXX")"
+APP_PID=""
+
+pid_binary() {
+    local pid="$1"
+    local value
+    value="$(/bin/ps -ww -o comm= -p "$pid" 2>/dev/null | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+    [[ "$value" == /* ]] || return 1
+    printf '%s/%s\n' "$(cd "$(dirname "$value")" && pwd -P)" "$(basename "$value")"
+}
+
+pid_is_app() {
+    [[ -n "$APP_PID" ]] || return 1
+    kill -0 "$APP_PID" 2>/dev/null || return 1
+    [[ "$(pid_binary "$APP_PID")" == "$BINARY" ]]
+}
+
+require_app_pid() {
+    pid_is_app || { echo "ERROR: PID $APP_PID no longer belongs to $BINARY." >&2; return 1; }
+}
+
+stop_app() {
+    [[ -n "$APP_PID" ]] || return 0
+    kill -0 "$APP_PID" 2>/dev/null || { wait "$APP_PID" 2>/dev/null || true; return 0; }
+    require_app_pid || return 1
+    kill -TERM "$APP_PID"
+    for _ in {1..50}; do
+        kill -0 "$APP_PID" 2>/dev/null || { wait "$APP_PID" 2>/dev/null || true; return 0; }
+        require_app_pid || return 1
+        sleep 0.1
+    done
+    require_app_pid || return 1
+    kill -KILL "$APP_PID"
+    for _ in {1..50}; do
+        kill -0 "$APP_PID" 2>/dev/null || { wait "$APP_PID" 2>/dev/null || true; return 0; }
+        sleep 0.1
+    done
+    echo "ERROR: App PID $APP_PID survived bounded TERM and KILL waits." >&2
+    return 1
+}
+
+cleanup() {
+    stop_app || true
+    safe_remove_tree "$TEST_ROOT" "$TEST_PARENT"
+}
+trap cleanup EXIT INT TERM
+mkdir -p "$TEST_ROOT/state" "$TEST_ROOT/scope"
+cat > "$TEST_ROOT/state/config.toml" <<EOF
+[suppression]
+spotlight = false
+quicklook = false
+materialize_dataless = true
+
+[scope]
+path = "$TEST_ROOT/scope"
+EOF
+
+ICLOUD_GUARD_HOME="$TEST_ROOT/state" \
+ICLOUD_GUARD_DISABLE_SYSTEM_INTEGRATIONS=1 \
+"$BINARY" &
+APP_PID=$!
+sleep 8
+require_app_pid
+RSS_START="$(/bin/ps -o rss= -p "$APP_PID" | tr -d ' ')"
+sleep 15
+require_app_pid
+RSS_END="$(/bin/ps -o rss= -p "$APP_PID" | tr -d ' ')"
+[[ "$RSS_START" =~ ^[0-9]+$ && "$RSS_END" =~ ^[0-9]+$ ]] || { echo "ERROR: RSS sampling failed." >&2; exit 1; }
+GROWTH=$((RSS_END - RSS_START))
+[[ "$GROWTH" -le 51200 ]] || { echo "ERROR: RSS grew ${GROWTH} KiB in 15 seconds." >&2; exit 1; }
+
+if [[ -x /usr/bin/leaks ]]; then
+    require_app_pid
+    /usr/bin/leaks "$APP_PID"
 fi
-
-# Step 2: Run test suite — exercises all code paths
-echo "[2/3] Running test suite..."
-TEST_OUTPUT=$(swift test 2>&1)
-echo "$TEST_OUTPUT" | grep -E "(Executed|failed)" | tail -2
-
-# Fail if tests failed
-if echo "$TEST_OUTPUT" | grep -q "Test Suite.*failed"; then
-    echo "FAIL: Test suite has failures"
-    exit 1
-fi
-
-# Step 3: Build app bundle (verifies packaging works)
-echo "[3/3] Building app bundle..."
-./scripts/build-app.sh --release 2>&1 | tail -1
-
-if [ ! -d ".build/ICloudGuard.app" ]; then
-    echo "FAIL: App bundle not built"
-    exit 1
-fi
-
-# Step 4: Local-only RSS check (requires display, not available in CI)
-if [ "$(uname)" = "Darwin" ] && [ -n "${DISPLAY:-}" ] || [ "$(uname)" = "Darwin" ] && [ -z "${CI:-}" ]; then
-    echo ""
-    echo "=== Local RSS Monitor ==="
-
-    # Kill any existing instance
-    pkill -f ICloudGuard 2>/dev/null || true
-    sleep 1
-
-    # Launch the app binary directly
-    ".build/ICloudGuard.app/Contents/MacOS/ICloudGuard" &
-    APP_PID=$!
-    sleep 8
-
-    if kill -0 $APP_PID 2>/dev/null; then
-        RSS_T0=$(ps -o rss= -p $APP_PID 2>/dev/null | tr -d ' ' || echo "0")
-        echo "  RSS at T+8s: ${RSS_T0} KB"
-
-        sleep 15
-        RSS_T1=$(ps -o rss= -p $APP_PID 2>/dev/null | tr -d ' ' || echo "0")
-        echo "  RSS at T+23s: ${RSS_T1} KB"
-
-        GROWTH=$((RSS_T1 - RSS_T0))
-        echo "  Growth: ${GROWTH} KB"
-
-        # Run leaks(1) — NSXPCConnection leaks are Apple framework bugs
-        if command -v leaks &>/dev/null; then
-            LEAKS_OUTPUT=$(leaks $APP_PID 2>&1 || true)
-            LEAK_COUNT=$(echo "$LEAKS_OUTPUT" | grep -o '[0-9]* leaks' | head -1 | grep -o '[0-9]*' || echo "0")
-            echo "  leaks(1): ${LEAK_COUNT} leaks (NSXPCConnection cycles are Apple framework bugs)"
-        fi
-
-        kill $APP_PID 2>/dev/null || true
-        wait $APP_PID 2>/dev/null || true
-
-        # Fail if growth > 50MB (51200 KB)
-        THRESHOLD=51200
-        if [ "$GROWTH" -gt "$THRESHOLD" ]; then
-            echo ""
-            echo "FAIL: RSS grew ${GROWTH} KB in 15s (threshold: ${THRESHOLD} KB)"
-            exit 1
-        fi
-    else
-        echo "  App exited early (no display?)"
-    fi
-fi
-
-echo ""
-echo "PASS: Memory leak guard passed"
-exit 0
+stop_app
+APP_PID=""
+echo "Leak guard passed: RSS growth ${GROWTH} KiB."

@@ -1,55 +1,81 @@
-name: Tip Release (every passing commit on tip branch)
+name: Tip Release
 
 on:
   push:
-    branches: [tip]
+    branches: [main]
+
+concurrency:
+  group: tip-release
+  cancel-in-progress: true
+
+permissions:
+  contents: write
 
 jobs:
   tip-release:
     runs-on: macos-14
-    permissions:
-      contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
 
       - name: Select Xcode
         run: sudo xcode-select -s /Applications/Xcode.app
 
-      - name: Build & Test
+      - name: Install pinned static-analysis tools
         run: |
-          swift build -c release
-          swift test
+          set -euo pipefail
+          TOOLS_DIR="$RUNNER_TEMP/static-tools"
+          scripts/ci-install-tools.sh "$TOOLS_DIR"
+          echo "$TOOLS_DIR" >> "$GITHUB_PATH"
 
-      - name: Build .app bundle
-        run: ./scripts/build-app.sh --release
-
-      - name: Generate version
-        id: version
+      - name: Guard current main commit
         run: |
-          NOW=$(date -u "+%Y.%-m%-d.%-H%-M%-S")
-          echo "version=$NOW" >> $GITHUB_OUTPUT
-          echo "Version: $NOW"
+          set -euo pipefail
+          CURRENT_MAIN="$(git ls-remote --exit-code origin refs/heads/main | awk '{print $1}')"
+          [[ "$CURRENT_MAIN" == "$GITHUB_SHA" ]] || {
+            echo "main advanced from $GITHUB_SHA to $CURRENT_MAIN; refusing stale tip release" >&2
+            exit 1
+          }
+          echo "RELEASE_TAG=tip-${GITHUB_SHA:0:12}" >> "$GITHUB_ENV"
 
-      - name: Create zip
+      - name: Verify release gates before publication
         run: |
-          cd .build
-          zip -r ICloudGuard-tip-${{ steps.version.outputs.version }}.zip ICloudGuard.app
+          set -euo pipefail
+          scripts/release-gate.sh --check --channel tip --tag "$RELEASE_TAG"
+          scripts/release-preflight.sh
+          scripts/test-release.sh
+          swift test \
+            --scratch-path "$RUNNER_TEMP/preflight-test-build" \
+            -Xswiftc -strict-concurrency=complete \
+            -Xswiftc -warnings-as-errors
+          scripts/build-app.sh \
+            --release \
+            --scratch-path "$RUNNER_TEMP/preflight-app-build" \
+            --output "$RUNNER_TEMP/preflight-ICloudGuard.app"
 
-      - name: Delete previous tip prerelease
-        run: gh release delete tip --cleanup-tag --yes || true
+      - name: Build and verify tip artifact
+        run: |
+          set -euo pipefail
+          scripts/release-gate.sh \
+            --channel tip \
+            --tag "$RELEASE_TAG" \
+            --output-dir "$RUNNER_TEMP/release" \
+            --build-number "$GITHUB_RUN_NUMBER"
+
+      - name: Publish immutable tip prerelease
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Create tip prerelease
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: tip
-          name: Tip Build (${{ steps.version.outputs.version }})
-          prerelease: true
-          files: .build/ICloudGuard-tip-${{ steps.version.outputs.version }}.zip
-          body: |
-            Automatically built from the latest `tip` branch commit.
-
-            Version: ${{ steps.version.outputs.version }}
-
-            This release is continuously updated. The previous tip build is replaced on every push.
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          CURRENT_MAIN="$(git ls-remote --exit-code origin refs/heads/main | awk '{print $1}')"
+          [[ "$CURRENT_MAIN" == "$GITHUB_SHA" ]] || {
+            echo "main advanced from $GITHUB_SHA to $CURRENT_MAIN; refusing stale tip release" >&2
+            exit 1
+          }
+          gh release create "$RELEASE_TAG" \
+            "$RUNNER_TEMP"/release/* \
+            --target "$GITHUB_SHA" \
+            --title "Tip Build ${GITHUB_SHA:0:12}" \
+            --prerelease \
+            --notes "Verified build of $GITHUB_SHA."
